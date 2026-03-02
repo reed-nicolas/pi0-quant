@@ -10,6 +10,7 @@ dependencies = [
     "pillow>=12.1.1",
     "pytest>=9.0.2",
     "safetensors>=0.7.0",
+    "sentencepiece>=0.1.99",
     "torch>=2.1",
     "transformers==4.53.2",
     "tree>=0.2.4",

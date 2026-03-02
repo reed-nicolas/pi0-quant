@@ -422,6 +422,8 @@ class Pi0PyTorchPolicy:
         norm_stats: dict | None = None,
         use_quantile_norm: bool = False,
         is_joint_position: bool = False,
+        max_token_len: int = 48,
+        tokenizer_path: str | None = None,
     ) -> None:
         self.model    = model
         self.device   = device
@@ -429,6 +431,27 @@ class Pi0PyTorchPolicy:
         self.norm_stats = norm_stats
         self.use_quantile_norm = use_quantile_norm
         self.is_joint_position = is_joint_position
+        self.max_token_len = max_token_len
+
+        # Load SentencePiece tokenizer for prompt encoding
+        import sentencepiece
+        if tokenizer_path is None:
+            # Try common locations
+            for candidate in [
+                Path.home() / "Desktop" / "paligemma_tokenizer.model",
+                Path.home() / ".cache" / "openpi" / "big_vision" / "paligemma_tokenizer.model",
+            ]:
+                if candidate.exists():
+                    tokenizer_path = str(candidate)
+                    break
+        if tokenizer_path is None:
+            raise FileNotFoundError(
+                "Cannot find paligemma_tokenizer.model. "
+                "Pass --tokenizer-path or place it at ~/.cache/openpi/big_vision/paligemma_tokenizer.model"
+            )
+        with open(tokenizer_path, "rb") as f:
+            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+        logger.info(f"Loaded tokenizer from {tokenizer_path} (vocab_size={self._tokenizer.vocab_size()})")
 
     # ── Normalization helpers (mirrors openpi/transforms.py) ──────────────
 
@@ -506,12 +529,31 @@ class Pi0PyTorchPolicy:
         state_padded[:norm_state.shape[0]] = norm_state
         state = torch.from_numpy(state_padded).unsqueeze(0).to(dev)  # (1, 32)
 
-        # ── Tokenised prompt: zeros (mask=0 → model ignores language) ────
-        max_tok = 200
-        tokenized_prompt      = torch.zeros(1, max_tok, dtype=torch.int64, device=dev)
-        tokenized_prompt_mask = torch.zeros(1, max_tok, dtype=torch.bool,  device=dev)
-        token_ar_mask         = torch.zeros(1, max_tok, dtype=torch.bool,  device=dev)
-        token_loss_mask       = torch.zeros(1, max_tok, dtype=torch.bool,  device=dev)
+        # ── Tokenise prompt (matches openpi PaligemmaTokenizer) ────────────
+        max_tok = self.max_token_len
+        prompt_text = obs.get("prompt", "")
+        if isinstance(prompt_text, bytes):
+            prompt_text = prompt_text.decode("utf-8")
+        prompt_text = prompt_text.strip().replace("_", " ").replace("\n", " ")
+
+        if prompt_text:
+            tokens = self._tokenizer.encode(prompt_text, add_bos=True) + self._tokenizer.encode("\n")
+        else:
+            tokens = []
+
+        tok_len = len(tokens)
+        if tok_len > max_tok:
+            tokens = tokens[:max_tok]
+            tok_len = max_tok
+        # Pad to max_tok
+        pad_len = max_tok - tok_len
+        tokens_padded = tokens + [0] * pad_len
+        mask_list = [True] * tok_len + [False] * pad_len
+
+        tokenized_prompt      = torch.tensor([tokens_padded], dtype=torch.int64, device=dev)
+        tokenized_prompt_mask = torch.tensor([mask_list],      dtype=torch.bool,  device=dev)
+        token_ar_mask         = torch.zeros(1, max_tok, dtype=torch.bool, device=dev)
+        token_loss_mask       = torch.zeros(1, max_tok, dtype=torch.bool, device=dev)
 
         obs_ns = SimpleNamespace(
             images=images,
@@ -646,6 +688,8 @@ def main() -> None:
         norm_stats=norm_stats,
         use_quantile_norm=use_quantile_norm,
         is_joint_position=is_joint_position,
+        max_token_len=cfg.max_token_len,
+        tokenizer_path=args.tokenizer_path,
     )
 
     from openpi.serving import websocket_policy_server
@@ -679,6 +723,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--norm-stats-dir", default=None,
                    help="Directory containing norm_stats.json "
                         "(default: tries <checkpoint-dir>/assets/droid/)")
+    p.add_argument("--tokenizer-path", default=None,
+                   help="Path to paligemma_tokenizer.model "
+                        "(default: auto-detect from ~/Desktop or ~/.cache/openpi/)")
     p.add_argument("--port",  type=int, default=8003)
     p.add_argument("--gpu",   type=int, default=0,
                    help="CUDA device index (-1 for CPU)")
