@@ -87,9 +87,9 @@ class MatVecQuantConfig:
     Constraint:
         vector_in_fmt == matrix_out_fmt (enforced by patch_model_matvec).
     """
-    matrix_in_fmt: QuantFormat = QuantFormat.FLOAT32
-    matrix_out_fmt: QuantFormat = QuantFormat.FLOAT32
-    vector_out_fmt: QuantFormat = QuantFormat.FLOAT32
+    matrix_in_fmt: QuantFormat = QuantFormat.BFLOAT16
+    matrix_out_fmt: QuantFormat = QuantFormat.BFLOAT16
+    vector_out_fmt: QuantFormat = QuantFormat.BFLOAT16
     ulp_noise: Optional[UlpNoiseConfig] = None
     skip_components: frozenset[Component] = field(default_factory=frozenset)
     label: str = ""
