@@ -255,7 +255,6 @@ def _run_combo_sweep(
     quantized_port: int,
     n_obs: int,
     seed: int,
-    max_rel_err: float,
     rel_err_step: float,
     rmse_threshold: float,
     ready_timeout: float,
@@ -291,7 +290,6 @@ def _run_combo_sweep(
         "--n-obs",              str(n_obs),
         "--seed",               str(seed),
         "--start-rel-err",        "0",
-        "--max-rel-err",          str(max_rel_err),
         "--rel-err-step",           str(rel_err_step),
         "--rmse-threshold",     str(rmse_threshold),
         "--ready-timeout-s",    str(ready_timeout),
@@ -351,15 +349,15 @@ def _stop_reason(inner_log_dir: Path) -> str:
     return "max_reached"
 
 
-def _max_tol_rel_err(data: list[dict], threshold: float, max_rel_err: int) -> int:
-    """Highest rel_err with rmse < threshold; max_rel_err if never exceeded; 0 if violated at step 1."""
+def _max_tol_rel_err(data: list[dict], threshold: float) -> float:
+    """Highest rel_err with rmse < threshold; actual max tested if never exceeded; 0 if violated at step 1."""
     passing = [d["rel_err"] for d in data if d["rmse"] < threshold]
     if not passing:
         return 0
     best = max(passing)
-    # If no data point exceeded the threshold at all, report max_rel_err
+    # If no data point exceeded the threshold at all, report the highest rel_err tested
     if all(d["rmse"] < threshold for d in data):
-        return max_rel_err
+        return max(d["rel_err"] for d in data)
     return best
 
 
@@ -433,7 +431,7 @@ def _plot_grid(results: list[dict], *, threshold: float, out_path: Path) -> None
     logger.info("Saved %s", out_path)
 
 
-def _plot_heatmap(results: list[dict], *, max_rel_err: int, out_path: Path) -> None:
+def _plot_heatmap(results: list[dict], *, out_path: Path) -> None:
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -442,6 +440,10 @@ def _plot_heatmap(results: list[dict], *, max_rel_err: int, out_path: Path) -> N
     except ImportError:
         logger.warning("matplotlib/numpy not available; skipping tolerance_hmap.png")
         return
+
+    # Derive the sweep upper bound from the actual data tested across all combos
+    all_rel_errs = [d["rel_err"] for r in results for d in r.get("data", [])]
+    max_rel_err = max(all_rel_errs) if all_rel_errs else 0.1
 
     fmts = SWEEP_FORMATS
     n = len(fmts)
@@ -535,7 +537,7 @@ def main() -> None:
     logger.info("Sweep: %d format combinations", len(combos))
     run_log_fh.write(f"# run_dir={run_dir}\n")
     run_log_fh.write(f"# combos={len(combos)}  n_obs={args.n_obs}  seed={args.seed}\n")
-    run_log_fh.write(f"# max_rel_err={args.max_rel_err}  rel_err_step={args.rel_err_step}  "
+    run_log_fh.write(f"# rel_err_step={args.rel_err_step}  "
                      f"rmse_threshold={args.rmse_threshold}\n\n")
     run_log_fh.flush()
 
@@ -588,7 +590,6 @@ def main() -> None:
                 quantized_port=args.quantized_port,
                 n_obs=args.n_obs,
                 seed=args.seed,
-                max_rel_err=args.max_rel_err,
                 rel_err_step=args.rel_err_step,
                 rmse_threshold=args.rmse_threshold,
                 ready_timeout=args.ready_timeout,
@@ -602,7 +603,7 @@ def main() -> None:
 
             inner_log_dir = combo_dir / "inner_logs"
             stop = _stop_reason(inner_log_dir)
-            max_tol = _max_tol_rel_err(data, args.rmse_threshold, args.max_rel_err)
+            max_tol = _max_tol_rel_err(data, args.rmse_threshold)
 
             combo_result = {
                 "input_fmt":     input_fmt,
@@ -616,7 +617,7 @@ def main() -> None:
             all_results.append(combo_result)
 
             summary_line = (
-                f"{label:30s}  max_tol_rel_err={max_tol:3d}  "
+                f"{label:30s}  max_tol_rel_err={max_tol:.4e}  "
                 f"n_points={len(data):2d}  stop={stop}"
             )
             print(summary_line)
@@ -640,8 +641,7 @@ def main() -> None:
     plots_dir.mkdir(exist_ok=True)
     _plot_grid(all_results, threshold=args.rmse_threshold,
                out_path=plots_dir / "ulp_rmse_grid.png")
-    _plot_heatmap(all_results, max_rel_err=args.max_rel_err,
-                  out_path=plots_dir / "tolerance_hmap.png")
+    _plot_heatmap(all_results, out_path=plots_dir / "tolerance_hmap.png")
 
     print(f"\nDone. Results in: {run_dir}")
     print(f"  summary.json     : {run_dir / 'summary.json'}")
@@ -674,7 +674,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--gpu-quant", type=int, default=1, help="CUDA device for quantized server")
     p.add_argument("--n-obs",      type=int,   default=16,  help="Observations per combo")
     p.add_argument("--seed",       type=int,   default=0)
-    p.add_argument("--max-rel-err",  type=float, default=0.1)
+
     p.add_argument("--rel-err-step",   type=float, default=1e-4)
     p.add_argument("--rmse-threshold", type=float, default=0.4)
     p.add_argument("--ready-timeout",  type=float, default=120.0,

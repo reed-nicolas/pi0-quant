@@ -322,8 +322,6 @@ def main() -> None:
                    help="Starting relative-error level for the sweep (inclusive).")
     p.add_argument("--rel-err-step", type=float, default=1e-4,
                    help="Increment for rel_err each sweep step (e.g. 1e-4 → 1e-4,2e-4,3e-4...).")
-    p.add_argument("--max-rel-err", type=float, default=0.1,
-                   help="Maximum rel_err to sweep up to (inclusive).")
     p.add_argument("--ready-timeout-s", type=float, default=60.0)
     p.add_argument("--use-fixed-pi0-noise", action="store_true",
                    help="If set, inject deterministic obs['pi0_noise'] (requires server to consume it)")
@@ -360,7 +358,6 @@ def main() -> None:
 
     start_rel_err = max(0.0, float(args.start_rel_err))
     rel_err_step  = max(1e-10, float(args.rel_err_step))
-    max_rel_err   = max(0.0, float(args.max_rel_err))
 
     log_root = Path(args.log_dir)
     if not log_root.is_absolute():
@@ -381,7 +378,7 @@ def main() -> None:
     run_log.write(f"# run_dir={run_dir}\n")
     run_log.write(f"# base={args.base_host}:{args.base_port}  quantized={args.quantized_host}:{args.quantized_port}\n")
     run_log.write(f"# n_obs={args.n_obs}  seed={args.seed}\n")
-    run_log.write(f"# sweep: start_rel_err={start_rel_err:.4e}  rel_err_step={rel_err_step:.4e}  max_rel_err={max_rel_err:.4e}\n")
+    run_log.write(f"# sweep: start_rel_err={start_rel_err:.4e}  rel_err_step={rel_err_step:.4e}\n")
     run_log.write(f"# use_fixed_pi0_noise={bool(use_fixed_pi0_noise)}\n")
     run_log.write(f"# quantized_server_cmd={args.quantized_server_cmd}\n\n")
     if base_q:
@@ -396,10 +393,13 @@ def main() -> None:
             obs = _with_fixed_pi0_noise(obs, rng=rng, action_horizon=action_horizon, action_dim=action_dim)
         observations.append(obs)
 
-    # Build the sweep values: start_rel_err, start+step, start+2*step, ... up to max_rel_err
-    n_steps = max(1, round((max_rel_err - start_rel_err) / rel_err_step) + 1)
-    sweep_values = [start_rel_err + i * rel_err_step for i in range(n_steps)
-                    if start_rel_err + i * rel_err_step <= max_rel_err + 1e-12]
+    # Generate sweep values until RMSE threshold is breached
+    def _sweep_values():
+        i = 0
+        while True:
+            yield start_rel_err + i * rel_err_step
+            i += 1
+    sweep_values = _sweep_values()
 
     quantized_proc: Optional[subprocess.Popen] = None
     quantized_log_fh: Optional[IO[str]] = None
