@@ -476,7 +476,7 @@ def _plot_heatmap(results: list[dict], *, out_path: Path) -> None:
         for ci in range(n):
             v = mat[ri, ci]
             if not (v != v):  # not NaN
-                ax.text(ci, ri, str(int(v)), ha="center", va="center",
+                ax.text(ci, ri, f"{v:.2f}", ha="center", va="center",
                         fontsize=10, color="black" if v < max_rel_err * 0.7 else "white")
 
     fig.tight_layout()
