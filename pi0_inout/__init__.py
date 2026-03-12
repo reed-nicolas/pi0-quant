@@ -31,16 +31,12 @@ Quick start:
 from .quant_types   import QuantFormat, quant, TORCH_DTYPE, FORMAT_BITS, all_formats, sweep_pairs, set_fp8_mode, get_fp8_mode
 from .quant_linear  import QuantLinear
 from .model_patcher import (
-    patch_model,
-    unpatch_model,
-    count_layers,
-    list_linear_layers,
+    patch_model, unpatch_model, count_layers, list_linear_layers,
     QuantAttnContext,
     QuantGroup, ALL_GROUPS,
     patch_attn_sdpa, unpatch_attn_sdpa,
 )
 from .stats_tracker import StatsTracker, Component, StatsReport
-from .rel_noise import RelNoiseConfig, inject_rel_noise
 from .eval_harness  import (
     QuantConfig,
     EvalResult,
@@ -50,6 +46,7 @@ from .eval_harness  import (
     results_to_dataframe,
     save_results,
 )
+
 __all__ = [
     # Types
     "QuantFormat",
@@ -72,9 +69,6 @@ __all__ = [
     "ALL_GROUPS",
     "patch_attn_sdpa",
     "unpatch_attn_sdpa",
-    # Relative-error noise utilities
-    "RelNoiseConfig",
-    "inject_rel_noise",
     # Stats
     "StatsTracker",
     "Component",

@@ -83,7 +83,6 @@ from pi0_inout.model_patcher import (
 )
 from pi0_inout.quant_linear import QuantLinear
 from pi0_inout.stats_tracker import StatsTracker
-from pi0_inout.rel_noise import RelNoiseConfig
 
 
 # ---------------------------------------------------------------------------
@@ -570,15 +569,8 @@ class Pi0PyTorchPolicy:
             token_loss_mask=token_loss_mask,
         )
 
-        # Optional fixed noise for reproducible comparisons (shape: (H, 32) or (1, H, 32)).
-        noise = None
-        if "pi0_noise" in obs:
-            noise = torch.from_numpy(np.asarray(obs["pi0_noise"], dtype=np.float32)).to(dev)
-            if noise.ndim == 2:
-                noise = noise.unsqueeze(0)  # (H, 32) → (1, H, 32)
-
         with torch.no_grad():
-            actions = self.model.sample_actions(str(dev), obs_ns, noise=noise, num_steps=10)
+            actions = self.model.sample_actions(str(dev), obs_ns, num_steps=10)
         # actions: [1, action_horizon, 32]  (normalized action space)
         actions = actions.squeeze(0).cpu().numpy()  # (horizon, 32)
 
@@ -646,12 +638,6 @@ def main() -> None:
 
     active_groups = {QuantGroup(g) for g in args.quantize_components}
 
-    # Relative-error noise injection into Linear matmul outputs
-    noise_cfg = None
-    if args.rel_err and args.rel_err > 0.0:
-        noise_cfg = RelNoiseConfig(rel_err=args.rel_err)
-        logger.info(f"Relative-error noise: input_fmt={input_fmt.value}  output_fmt={output_fmt.value}  rel_err={args.rel_err:.4e}")
-
     tracker = StatsTracker()
     patch_model(
         model=model,
@@ -659,7 +645,6 @@ def main() -> None:
         output_fmt=output_fmt,
         tracker=tracker,
         active_groups=active_groups,
-        noise_cfg=noise_cfg,
         verbose=False,
     )
     attn_handles = patch_attn_sdpa(
@@ -727,8 +712,6 @@ def main() -> None:
         max_token_len=cfg.max_token_len,
         tokenizer_path=args.tokenizer_path,
     )
-    policy.metadata["action_dim"]     = cfg.action_dim
-    policy.metadata["action_horizon"] = cfg.action_horizon
 
     from openpi.serving import websocket_policy_server
     import socket
@@ -786,15 +769,14 @@ def parse_args() -> argparse.Namespace:
         choices=[g.value for g in ALL_GROUPS],
         metavar="COMPONENT",
         help=(
-            "Which model components to quantize (default: all). "
+            "Which model components to quantize (default: all three). "
             "Choices: vision  transformer  action_head. "
+            "  vision      — SigLIP ViT encoder "
+            "  transformer — PaliGemma LM + action expert (co-attention coupled) "
+            "  action_head — action/state/time projection MLPs "
             "Example: --quantize-components transformer action_head"
         ),
     )
-
-    # Optional: relative-error noise injection into matmul outputs
-    p.add_argument("--rel-err", type=float, default=0.0,
-                   help="Inject +/- rel_err * |y| noise into each Linear matmul output (0 disables)")
 
     # Output
     p.add_argument("--stats-output", default=None,

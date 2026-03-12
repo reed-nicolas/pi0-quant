@@ -32,7 +32,6 @@ from typing import Optional
 
 from .quant_types import QuantFormat, quant
 from .stats_tracker import StatsTracker, Component
-from .rel_noise import RelNoiseConfig, inject_rel_noise
 
 
 class QuantLinear(nn.Module):
@@ -47,7 +46,6 @@ class QuantLinear(nn.Module):
         component:    Architectural component tag (vision/language/action_*).
         layer_name:   Full dot-separated module path, used as stats key.
         tracker:      Optional StatsTracker for RMSE collection.
-        noise_cfg:    Optional RelNoiseConfig for relative-error noise injection.
     """
 
     def __init__(
@@ -58,7 +56,6 @@ class QuantLinear(nn.Module):
         component: Component,
         layer_name: str,
         tracker: Optional[StatsTracker] = None,
-        noise_cfg: Optional[RelNoiseConfig] = None,
     ) -> None:
         super().__init__()
         self.weight = linear.weight
@@ -69,7 +66,6 @@ class QuantLinear(nn.Module):
         self.component  = component
         self.layer_name = layer_name
         self.tracker    = tracker
-        self.noise_cfg  = noise_cfg
 
         self.in_features  = linear.in_features
         self.out_features = linear.out_features
@@ -87,12 +83,8 @@ class QuantLinear(nn.Module):
         w_q = quant(w_f32, self.input_fmt)   # weight
         b_q = quant(b_f32, self.input_fmt) if b_f32 is not None else None  # bias
 
-        # ── Accumulate in float32: F.linear + bias add ──────────────────────────
-        # Split F.linear and bias-add so we can optionally inject noise into the matmul output.
-        y_mm = F.linear(x_q, w_q, None)
-        if self.noise_cfg is not None and self.noise_cfg.enabled():
-            y_mm = inject_rel_noise(y_mm, rel_err=self.noise_cfg.rel_err)
-        y_accum = y_mm if b_q is None else (y_mm + b_q)
+        # ── Accumulate in float32: matmul + bias add ──────────────────────────
+        y_accum = F.linear(x_q, w_q, b_q)
 
         # ── Write result to output memory in output_fmt ───────────────────────
         y_out = quant(y_accum, self.output_fmt)
@@ -116,4 +108,3 @@ class QuantLinear(nn.Module):
             f"input_fmt={self.input_fmt.value}, output_fmt={self.output_fmt.value}, "
             f"component={self.component.value}"
         )
-

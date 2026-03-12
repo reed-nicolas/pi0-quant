@@ -79,7 +79,6 @@ import torch.nn.functional as F
 from .quant_linear import QuantLinear
 from .quant_types import QuantFormat, quant
 from .stats_tracker import Component, StatsTracker
-from .rel_noise import RelNoiseConfig
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +161,6 @@ def patch_model(
     output_fmt: QuantFormat,
     tracker: Optional[StatsTracker] = None,
     active_groups: Optional[set[QuantGroup]] = None,
-    noise_cfg: Optional[RelNoiseConfig] = None,
-    skip_components: Optional[set[Component]] = None,
     verbose: bool = False,
 ) -> nn.Module:
     """
@@ -210,7 +207,6 @@ def patch_model(
             component=component,
             layer_name=name,
             tracker=tracker,
-            noise_cfg=noise_cfg,
         )
 
         # Pre-register with tracker so summary() works even if some layers
@@ -243,7 +239,6 @@ def patch_model(
     return model
 
 
-
 def unpatch_model(model: nn.Module) -> nn.Module:
     """
     Reverse patch_model: replace every QuantLinear back to a plain nn.Linear.
@@ -266,18 +261,6 @@ def unpatch_model(model: nn.Module) -> nn.Module:
 
     print(f"[unpatch_model] Restored {n_restored} QuantLinear → nn.Linear.")
     return model
-
-
-def set_noise_cfg(model: nn.Module, noise_cfg: Optional[RelNoiseConfig]) -> None:
-    """
-    Update the noise configuration on all patched Linear layers in-place.
-
-    This enables changing noise injection at runtime (without re-patching), as long
-    as the model has already been patched with QuantLinear.
-    """
-    for _, module in model.named_modules():
-        if isinstance(module, QuantLinear):
-            module.noise_cfg = noise_cfg
 
 
 # ---------------------------------------------------------------------------

@@ -51,7 +51,6 @@ import torch.nn as nn
 from .quant_types import QuantFormat
 from .model_patcher import patch_model, unpatch_model, count_layers
 from .stats_tracker import StatsTracker, StatsReport, Component
-from .rel_noise import RelNoiseConfig
 
 
 # ---------------------------------------------------------------------------
@@ -70,14 +69,12 @@ class QuantConfig:
     """
     input_fmt:  QuantFormat = QuantFormat.BFLOAT16
     output_fmt: QuantFormat = QuantFormat.BFLOAT16
-    noise_cfg: Optional[RelNoiseConfig] = None
     skip_components: frozenset[Component] = field(default_factory=frozenset)
     label: str = ""
 
     def __post_init__(self):
         if not self.label:
             self.label = f"in={self.input_fmt.value}_out={self.output_fmt.value}"
-
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +174,6 @@ def run_quantization_eval(
         input_fmt=config.input_fmt,
         output_fmt=config.output_fmt,
         tracker=tracker,
-        noise_cfg=config.noise_cfg,
         skip_components=set(config.skip_components),
         verbose=False,
     )
@@ -220,7 +216,6 @@ def run_quantization_eval(
         n_observations=len(observations),
         inference_time_s=elapsed,
     )
-
 
 
 # ---------------------------------------------------------------------------
