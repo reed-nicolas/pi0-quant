@@ -128,16 +128,20 @@ def _infer_component(path: str) -> Component:
 # ---------------------------------------------------------------------------
 
 class QuantGroup(str, Enum):
-    VISION      = "vision"       # SigLIP ViT — independent, cleanly separable
-    TRANSFORMER = "transformer"  # PaliGemma LM + action expert — co-attention coupled
-    ACTION_HEAD = "action_head"  # Thin MLPs at Pi0 root — no attention
+    VISION        = "vision"         # SigLIP ViT — independent, cleanly separable
+    TRANSFORMER   = "transformer"    # PaliGemma LM + action expert — co-attention coupled
+    LANGUAGE      = "language"       # Gemma 2.6B LM only (software analysis; shares KV interface with action_expert)
+    ACTION_EXPERT = "action_expert"  # Gemma 300M action expert only (software analysis)
+    ACTION_HEAD   = "action_head"    # Thin MLPs at Pi0 root — no attention
 
 
 # Maps each QuantGroup to the fine-grained Components it covers.
 _GROUP_TO_COMPONENTS: dict[QuantGroup, frozenset[Component]] = {
-    QuantGroup.VISION:      frozenset({Component.VISION}),
-    QuantGroup.TRANSFORMER: frozenset({Component.LANGUAGE, Component.ACTION_EXPERT}),
-    QuantGroup.ACTION_HEAD: frozenset({Component.ACTION_HEAD}),
+    QuantGroup.VISION:        frozenset({Component.VISION}),
+    QuantGroup.TRANSFORMER:   frozenset({Component.LANGUAGE, Component.ACTION_EXPERT}),
+    QuantGroup.LANGUAGE:      frozenset({Component.LANGUAGE}),
+    QuantGroup.ACTION_EXPERT: frozenset({Component.ACTION_EXPERT}),
+    QuantGroup.ACTION_HEAD:   frozenset({Component.ACTION_HEAD}),
 }
 
 ALL_GROUPS: list[QuantGroup] = list(QuantGroup)

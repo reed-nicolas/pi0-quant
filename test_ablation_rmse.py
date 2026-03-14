@@ -4,11 +4,16 @@ test_ablation_rmse.py
 Ablation RMSE sweep over all 7 subsets of {vision, transformer, action_head}.
 
 Metrics:
-  act_rmse     — action output RMSE vs unquantized bf16 baseline (absolute,
-                 in normalized joint space ≈ [-1, 1])
-  avg_rel_rmse — mean relative RMSE across every quantized linear layer:
-                 rel_rmse = rmse / rms(y_fp32) per layer, then averaged.
-                 Dimensionless — 0.01 means 1% of activation magnitude.
+  act_rmse            — action output RMSE vs bf16 baseline (absolute,
+                        normalized joint space ≈ [-1, 1])
+  act_snr_db          — SNR in dB: 20*log10(rms_baseline / act_rmse)
+  max_act_err         — worst-case single action element error (safety metric)
+  act_cos_sim         — mean cosine similarity of action vectors vs baseline
+  avg_rel_rmse        — mean(rmse / rms_fp32) across all quantized linear layers
+  pct_layers_above_5  — % of quantized layers with rel_rmse > 5%
+  rel_vision / rel_language / rel_act_exp / rel_act_head
+                      — per-component mean relative RMSE
+  joint_{0..7}_rmse   — per-DOF action RMSE (joints 0-6 + gripper)
 
 Data: real DROID frames from droid_100 (parquet + MP4 videos).
       Images decoded and letterbox-resized to 224×224.
@@ -17,10 +22,13 @@ Usage:
     OPENPI_DIR=/scratch/chloe.wong/openpi \
     CUDA_VISIBLE_DEVICES=0 \
     /scratch/chloe.wong/envs/pi0/bin/python test_ablation_rmse.py
+
+Results saved to ablation_results.csv in the same directory.
 """
 
 from __future__ import annotations
 
+import csv
 import math
 import os
 import sys
@@ -67,12 +75,21 @@ INPUT_FMT  = QuantFormat.FLOAT8_E4M3
 OUTPUT_FMT = QuantFormat.FLOAT16
 
 N_FRAMES   = 8   # real frames to evaluate on
+N_JOINTS   = 8   # 7 arm joints + 1 gripper
+REL_THRESH = 0.05  # layers above this rel_rmse are flagged (5%)
 
-ALL_GROUPS = [QuantGroup.VISION, QuantGroup.TRANSFORMER, QuantGroup.ACTION_HEAD]
+CSV_OUTPUT = Path(__file__).resolve().parent / "ablation_results_4group.csv"
 
-# All non-empty subsets of the 3 groups (7 total)
+ALL_GROUPS = [
+    QuantGroup.VISION,
+    QuantGroup.LANGUAGE,
+    QuantGroup.ACTION_EXPERT,
+    QuantGroup.ACTION_HEAD,
+]
+
+# All non-empty subsets of the 4 groups (15 total: 4C1+4C2+4C3+4C4)
 CONFIGS: list[tuple[str, set[QuantGroup]]] = []
-for r in [1, 2, 3]:
+for r in [1, 2, 3, 4]:
     for combo in combinations(ALL_GROUPS, r):
         label = "+".join(g.value for g in combo)
         CONFIGS.append((label, set(combo)))
@@ -237,11 +254,35 @@ def run_config(
     unpatch_attn_sdpa(attn_handles)
     unpatch_model(model)
 
-    # Action output RMSE (absolute)
-    act_rmse = float(np.mean([
-        (ref.float() - q.float()).pow(2).mean().sqrt().item()
-        for ref, q in zip(baseline_actions, quant_actions)
+    # Per-frame error tensors — shape (num_steps, n_joints) each
+    errors = [ref.float() - q.float() for ref, q in zip(baseline_actions, quant_actions)]
+
+    # Action output RMSE (absolute, averaged over frames)
+    act_rmse = float(np.mean([e.pow(2).mean().sqrt().item() for e in errors]))
+
+    # SNR in dB: 20*log10(rms_signal / rmse)
+    rms_baseline = float(np.mean([
+        ref.float().pow(2).mean().sqrt().item() for ref in baseline_actions
     ]))
+    act_snr_db = (20.0 * math.log10(rms_baseline / act_rmse)
+                  if act_rmse > 0 else float("inf"))
+
+    # Worst-case single action element error across all frames
+    max_act_err = float(max(e.abs().max().item() for e in errors))
+
+    # Cosine similarity: flatten (num_steps, n_joints) → 1D vector per frame
+    cos_sims = [
+        F.cosine_similarity(ref.float().flatten().unsqueeze(0),
+                            q.float().flatten().unsqueeze(0)).item()
+        for ref, q in zip(baseline_actions, quant_actions)
+    ]
+    act_cos_sim = float(np.mean(cos_sims))
+
+    # Per-joint RMSE: mean over time steps, then average over frames
+    joint_rmse_per_frame = [e.pow(2).mean(dim=0).sqrt() for e in errors]  # each (n_joints,)
+    per_joint_rmse = torch.stack(joint_rmse_per_frame).mean(dim=0).tolist()
+    # Pad or trim to N_JOINTS in case action dim differs
+    per_joint_rmse = (per_joint_rmse + [float("nan")] * N_JOINTS)[:N_JOINTS]
 
     # Average relative RMSE across all quantized layers
     report = tracker.summary()
@@ -252,16 +293,25 @@ def run_config(
     ]
     avg_rel_rmse = float(np.mean(all_rel)) if all_rel else float("nan")
 
-    # Per-component breakdown for reference
+    # % of layers with rel_rmse above threshold
+    n_above = sum(1 for v in all_rel if v > REL_THRESH)
+    pct_layers_above_5 = 100.0 * n_above / len(all_rel) if all_rel else float("nan")
+
+    # Per-component breakdown
     comp_rel = {
         row["component"]: row["mean_rel_rmse"]
         for row in report.to_dict().get("components", [])
     }
 
     return {
-        "act_rmse":     act_rmse,
-        "avg_rel_rmse": avg_rel_rmse,
-        "comp_rel":     comp_rel,
+        "act_rmse":           act_rmse,
+        "act_snr_db":         act_snr_db,
+        "max_act_err":        max_act_err,
+        "act_cos_sim":        act_cos_sim,
+        "avg_rel_rmse":       avg_rel_rmse,
+        "pct_layers_above_5": pct_layers_above_5,
+        "comp_rel":           comp_rel,
+        "per_joint_rmse":     per_joint_rmse,
     }
 
 
@@ -270,9 +320,11 @@ def run_config(
 def print_results(results: list[dict]) -> None:
     comp_cols    = ["vision", "language", "action_expert", "action_head"]
     comp_headers = ["rel_vision", "rel_language", "rel_act_exp", "rel_act_head"]
-    cw = 14
+    cw = 13
 
-    header = f"{'config':<28s}  {'act_rmse':>{cw}}  {'avg_rel_rmse':>{cw}}"
+    header = (f"{'config':<28s}  {'act_rmse':>{cw}}  {'snr_db':>{cw}}  "
+              f"{'max_err':>{cw}}  {'cos_sim':>{cw}}  {'avg_rel_rmse':>{cw}}  "
+              f"{'pct_>5%':>{cw}}")
     for h in comp_headers:
         header += f"  {h:>{cw}}"
     sep = "-" * len(header)
@@ -286,7 +338,11 @@ def print_results(results: list[dict]) -> None:
 
     for r in results:
         row = (f"{r['label']:<28s}  {r['act_rmse']:>{cw}.4e}  "
-               f"{r['avg_rel_rmse']:>{cw}.4e}")
+               f"{r['act_snr_db']:>{cw}.2f}  "
+               f"{r['max_act_err']:>{cw}.4e}  "
+               f"{r['act_cos_sim']:>{cw}.6f}  "
+               f"{r['avg_rel_rmse']:>{cw}.4e}  "
+               f"{r['pct_layers_above_5']:>{cw}.1f}")
         for c in comp_cols:
             v = r["comp_rel"].get(c)
             row += f"  {(f'{v:.4e}' if v is not None else 'N/A'):>{cw}}"
@@ -294,8 +350,41 @@ def print_results(results: list[dict]) -> None:
 
     print(f"{'=' * len(header)}")
     print("act_rmse     = action output RMSE vs bf16 baseline (normalized joint space)")
+    print("act_snr_db   = 20*log10(rms_baseline / act_rmse)")
+    print("max_act_err  = worst-case single action element error")
+    print("cos_sim      = mean cosine similarity of action vectors vs baseline")
     print("avg_rel_rmse = mean(rmse / rms_fp32) across all quantized linear layers")
+    print("pct_>5%      = % of quantized layers with rel_rmse > 5%")
     print("rel_*        = per-component mean relative RMSE")
+
+
+def save_csv(results: list[dict], path: Path) -> None:
+    comp_cols = ["vision", "language", "action_expert", "action_head"]
+    fieldnames = (
+        ["config", "act_rmse", "act_snr_db", "max_act_err", "act_cos_sim",
+         "avg_rel_rmse", "pct_layers_above_5"]
+        + [f"rel_{c}" for c in comp_cols]
+        + [f"joint_{i}_rmse" for i in range(N_JOINTS)]
+    )
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in results:
+            row: dict = {
+                "config":             r["label"],
+                "act_rmse":           r["act_rmse"],
+                "act_snr_db":         r["act_snr_db"],
+                "max_act_err":        r["max_act_err"],
+                "act_cos_sim":        r["act_cos_sim"],
+                "avg_rel_rmse":       r["avg_rel_rmse"],
+                "pct_layers_above_5": r["pct_layers_above_5"],
+            }
+            for c in comp_cols:
+                row[f"rel_{c}"] = r["comp_rel"].get(c, float("nan"))
+            for i, v in enumerate(r["per_joint_rmse"]):
+                row[f"joint_{i}_rmse"] = v
+            writer.writerow(row)
+    print(f"\nResults saved to {path}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -330,6 +419,7 @@ def main() -> None:
         print(f"  act_rmse={r['act_rmse']:.4e}  avg_rel_rmse={r['avg_rel_rmse']:.4e}")
 
     print_results(all_results)
+    save_csv(all_results, CSV_OUTPUT)
 
 
 if __name__ == "__main__":

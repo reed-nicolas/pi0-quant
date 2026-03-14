@@ -36,6 +36,10 @@ from .model_patcher import (
     QuantGroup, ALL_GROUPS,
     patch_attn_sdpa, unpatch_attn_sdpa,
 )
+from .quant_vector import (
+    patch_vector_ops, unpatch_vector_ops,
+    VectorQuantMode, TARGET_OPS,
+)
 from .stats_tracker import StatsTracker, Component, StatsReport
 from .eval_harness  import (
     QuantConfig,
@@ -69,6 +73,11 @@ __all__ = [
     "ALL_GROUPS",
     "patch_attn_sdpa",
     "unpatch_attn_sdpa",
+    # Vector ops
+    "patch_vector_ops",
+    "unpatch_vector_ops",
+    "VectorQuantMode",
+    "TARGET_OPS",
     # Stats
     "StatsTracker",
     "Component",
