@@ -4,9 +4,9 @@ Replaces the Python scalar loops in compute_now / compute_lane with compiled
 machine code.  The batch kernel processes a full activation batch in one call,
 parallelising over batch elements with prange.
 
-Constants are hardcoded for the default InnerProductTreeParams:
-  vecLen=32, numLanes=16, accumIntWidth=0
-  → anchorHeadroom=7, intWidth=30, sentinel=-1024
+Constants are hardcoded for the current InnerProductTreeParams:
+  vecLen=32, numLanes=32, accumIntWidth=0
+  → anchorHeadroom=7, intWidth=32, sentinel=-1024
 """
 from __future__ import annotations
 
@@ -23,45 +23,40 @@ MUL_LUT: np.ndarray = np.array(_lut_list, dtype=np.int32)  # shape (65536,)
 
 # ---------------------------------------------------------------------------
 # Inner helpers – all @njit so Numba inlines them into compute_lanes_batch.
+# intWidth = 32 throughout (was 30 in the previous 32×16 config).
 # ---------------------------------------------------------------------------
 
 @njit(cache=True, inline="always")
-def _wrap30(v: np.int64) -> np.int64:
-    v = v & np.int64(0x3FFFFFFF)
-    if v & np.int64(0x20000000):
-        v -= np.int64(0x40000000)
+def _wrap32(v: np.int64) -> np.int64:
+    """Wrap to signed 32-bit (intWidth=32)."""
+    v = v & np.int64(0xFFFFFFFF)
+    if v & np.int64(0x80000000):
+        v -= np.int64(0x100000000)
     return v
 
 
 @njit(cache=True, inline="always")
 def _prod_to_aligned(prod_bits: np.int32, anchor: np.int32) -> np.int64:
-    """e4m3_prod_to_aligned_int hardcoded to int_width=30."""
+    """e4m3_prod_to_aligned_int hardcoded to int_width=32."""
     exp_bits = (prod_bits >> np.int32(7)) & np.int32(0x1F)
     if exp_bits == np.int32(0):
         return np.int64(0)
     sign     = (prod_bits >> np.int32(12)) & np.int32(1)
     man      = prod_bits & np.int32(0x7F)
-    # left_pad = int_width - sig_width = 30 - 8 = 22
-    sig_wide = (np.int64(0x80) | np.int64(man)) << np.int64(22)
+    # left_pad = int_width - sig_width = 32 - 8 = 24
+    sig_wide = (np.int64(0x80) | np.int64(man)) << np.int64(24)
     rshift   = np.int32(anchor) - (exp_bits - np.int32(13))  # anchor - unb_exp
-    """rshift = anchor - unb_exp.  anchor = max_prod_exp + ANCHOR_HR (7), so
-    rshift >= ANCHOR_HR = 7 for every product in the accumulation pass.
-    The left-shift branch is probably dead and omitted."""
-    # if rshift < np.int32(0):
-    #     shifted = sig_wide << np.int64(-rshift)
-    # else:
-    #     shifted = sig_wide >> np.int64(rshift)
     shifted  = sig_wide >> np.int64(rshift)
-    mag      = shifted & np.int64(0x3FFFFFFF)
-    return _wrap30(-mag if sign else mag)
+    mag      = shifted & np.int64(0xFFFFFFFF)
+    return _wrap32(-mag if sign else mag)
 
 
 @njit(cache=True, inline="always")
 def _bias_to_aligned(bias_bits: np.int32, anchor: np.int32) -> np.int64:
-    """ieee_to_aligned_int for E4M3 bias (mant=3, ieeeBias=7), int_width=30.
+    """ieee_to_aligned_int for E4M3 bias (mant=3, ieeeBias=7), int_width=32.
 
     shift_right = anchor - unb_exp - (int_width - 1 - mant_bits)
-                = anchor - unb_exp - 26
+                = anchor - unb_exp - 28
     """
     sign      = (bias_bits >> np.int32(7)) & np.int32(1)
     exp_field = (bias_bits >> np.int32(3)) & np.int32(0xF)
@@ -70,25 +65,25 @@ def _bias_to_aligned(bias_bits: np.int32, anchor: np.int32) -> np.int64:
         return np.int64(0)
     unb_exp  = exp_field - np.int32(7)
     full_sig = np.int64(frac) if exp_field == np.int32(0) else (np.int64(0x8) | np.int64(frac))
-    rshift   = np.int32(anchor) - unb_exp - np.int32(26)
-    if rshift >= np.int32(30):
+    rshift   = np.int32(anchor) - unb_exp - np.int32(28)
+    if rshift >= np.int32(32):
         mag = np.int64(0)
     elif rshift >= np.int32(0):
         mag = full_sig >> np.int64(rshift)
-    elif rshift > np.int32(-30):
+    elif rshift > np.int32(-32):
         mag = full_sig << np.int64(-rshift)
     else:
         mag = np.int64(0)
-    mag &= np.int64(0x3FFFFFFF)
-    return _wrap30(-mag if sign else mag)
+    mag &= np.int64(0xFFFFFFFF)
+    return _wrap32(-mag if sign else mag)
 
 
 @njit(cache=True, inline="always")
 def _psum_to_aligned(psum_bits: np.int32, anchor: np.int32) -> np.int64:
-    """ieee_to_aligned_int for BF16 psum (mant=7, ieeeBias=127), int_width=30.
+    """ieee_to_aligned_int for BF16 psum (mant=7, ieeeBias=127), int_width=32.
 
     shift_right = anchor - unb_exp - (int_width - 1 - mant_bits)
-                = anchor - unb_exp - 22
+                = anchor - unb_exp - 24
     """
     sign      = (psum_bits >> np.int32(15)) & np.int32(1)
     exp_field = (psum_bits >> np.int32(7)) & np.int32(0xFF)
@@ -97,42 +92,79 @@ def _psum_to_aligned(psum_bits: np.int32, anchor: np.int32) -> np.int64:
         return np.int64(0)
     unb_exp  = exp_field - np.int32(127)
     full_sig = np.int64(frac) if exp_field == np.int32(0) else (np.int64(0x80) | np.int64(frac))
-    rshift   = np.int32(anchor) - unb_exp - np.int32(22)
-    if rshift >= np.int32(30):
+    rshift   = np.int32(anchor) - unb_exp - np.int32(24)
+    if rshift >= np.int32(32):
         mag = np.int64(0)
     elif rshift >= np.int32(0):
         mag = full_sig >> np.int64(rshift)
-    elif rshift > np.int32(-30):
+    elif rshift > np.int32(-32):
         mag = full_sig << np.int64(-rshift)
     else:
         mag = np.int64(0)
-    mag &= np.int64(0x3FFFFFFF)
-    return _wrap30(-mag if sign else mag)
+    mag &= np.int64(0xFFFFFFFF)
+    return _wrap32(-mag if sign else mag)
 
 
 @njit(cache=True, inline="always")
-def _f32_to_bf16_rne(f64_val: float) -> np.int32:
-    tmp = np.empty(1, dtype=np.float32)
-    tmp[0] = np.float32(f64_val)
-    u = tmp.view(np.uint32)[0]
-    exp = (u >> np.uint32(23)) & np.uint32(0xFF)
-    if exp == np.uint32(255):
-        if u & np.uint32(0x7FFFFF):
+def _f64_to_bf16_rne(f64_val: float) -> np.int32:
+    """Convert float64 directly to BF16 with single RNE rounding.
+
+    Avoids the double-rounding of float64→float32→BF16.
+    The RTL uses HardFloat INToRecFN which rounds once from the
+    full-precision integer to BF16.
+    """
+    tmp = np.empty(1, dtype=np.float64)
+    tmp[0] = f64_val
+    d = tmp.view(np.uint64)[0]
+    sign = np.int32((d >> np.uint64(63)) & np.uint64(1))
+    d_exp = np.int32((d >> np.uint64(52)) & np.uint64(0x7FF))
+    d_frac = np.int64(d & np.uint64(0xFFFFFFFFFFFFF))
+
+    if d_exp == np.int32(0x7FF):
+        if d_frac != np.int64(0):
             return np.int32(0x7FC0)
-        return np.int32((u >> np.uint32(16)) & np.uint32(0xFFFF))
-    upper   = u >> np.uint32(16)
-    rounded = u + np.uint32(0x7FFF) + (upper & np.uint32(1))
-    return np.int32((rounded >> np.uint32(16)) & np.uint32(0xFFFF))
+        return np.int32(0xFF80) if sign else np.int32(0x7F80)
+    if d_exp == np.int32(0):
+        return np.int32(0)
+
+    unb_exp = d_exp - np.int32(1023)
+    full_sig = (np.int64(1) << np.int64(52)) | d_frac  # 53-bit significand
+
+    # Round 53-bit significand to 8-bit (1 implicit + 7 mantissa).
+    # Drop the bottom 45 bits with RNE.
+    shift = np.int64(45)
+    top8 = np.int32(full_sig >> shift)                       # [128, 255]
+    guard = np.int32((full_sig >> (shift - np.int64(1))) & np.int64(1))
+    sticky_mask = (np.int64(1) << (shift - np.int64(1))) - np.int64(1)
+    sticky = np.int32(1) if (full_sig & sticky_mask) != np.int64(0) else np.int32(0)
+    lsb = top8 & np.int32(1)
+    top8 = top8 + (guard & (sticky | lsb))                  # RNE
+
+    if top8 >= np.int32(256):       # carry from rounding
+        top8 = top8 >> np.int32(1)
+        unb_exp = unb_exp + np.int32(1)
+
+    biased_exp = unb_exp + np.int32(127)
+    if biased_exp >= np.int32(0xFF):
+        return np.int32(0xFF7F) if sign else np.int32(0x7F7F)
+    if biased_exp <= np.int32(0):
+        return np.int32(0)
+
+    return (sign << np.int32(15)) | (biased_exp << np.int32(7)) | (top8 & np.int32(0x7F))
 
 
 @njit(cache=True, inline="always")
 def _aligned_to_bf16(int_in: np.int64, anchor: np.int32) -> np.int32:
-    """aligned_int_to_bf16 hardcoded to int_width=30."""
-    val = _wrap30(int_in)
+    """aligned_int_to_bf16 hardcoded to int_width=32.
+
+    Uses float64 as an exact intermediate (32-bit int fits in 52-bit
+    mantissa), then a single RNE round to BF16 — no float32 detour.
+    """
+    val = _wrap32(int_in)
     if val == np.int64(0):
         return np.int32(0)
-    f = math.ldexp(float(val), int(anchor) - 29)  # anchor - (int_width - 1)
-    return _f32_to_bf16_rne(f)
+    f = math.ldexp(float(val), int(anchor) - 31)  # anchor - (int_width - 1)
+    return _f64_to_bf16_rne(f)
 
 
 @njit(cache=True, inline="always")
@@ -261,9 +293,11 @@ def compute_lanes_batch(
             anchor = (max_pe if max_pe >= addend_exp else addend_exp) + ANCHOR_HR
 
             # ── Pass 2: accumulate from cached products ───────────────────
+            # RTL uses treeReduce with +& (width-extending add); intermediate
+            # sums can exceed intWidth.  Truncation happens once at the end.
             prod_sum = np.int64(0)
             for i in range(vec_len):
-                prod_sum = _wrap30(prod_sum + _prod_to_aligned(prods[i], anchor))
+                prod_sum = prod_sum + _prod_to_aligned(prods[i], anchor)
 
             # ── Addend ───────────────────────────────────────────────────
             if addend_sel == np.int32(1):
@@ -273,7 +307,7 @@ def compute_lanes_batch(
             else:
                 addend_int = np.int64(0)
 
-            total_int = _wrap30(prod_sum + addend_int)
+            total_int = _wrap32(prod_sum + addend_int)
             bf16_bits = _aligned_to_bf16(total_int, anchor)
             out[b_idx, lane_idx] = (
                 _out_stage(bf16_bits, out_fmt_sel, np.int32(scale_exp[lane_idx]))
@@ -286,10 +320,10 @@ def compute_lanes_batch(
 def warmup() -> None:
     """Trigger JIT compilation with dummy data.  Call once at startup."""
     dummy_acts  = np.zeros((1, 32), dtype=np.uint8)
-    dummy_wbuf  = np.zeros((16, 32), dtype=np.uint8)
-    dummy_bias  = np.zeros(16, dtype=np.uint8)
-    dummy_psums = np.zeros((1, 16), dtype=np.int32)
-    dummy_sexp  = np.zeros(16, dtype=np.int32)
+    dummy_wbuf  = np.zeros((32, 32), dtype=np.uint8)
+    dummy_bias  = np.zeros(32, dtype=np.uint8)
+    dummy_psums = np.zeros((1, 32), dtype=np.int32)
+    dummy_sexp  = np.zeros(32, dtype=np.int32)
     compute_lanes_batch(
         dummy_acts, dummy_wbuf, dummy_wbuf,
         dummy_bias, dummy_psums, dummy_sexp,

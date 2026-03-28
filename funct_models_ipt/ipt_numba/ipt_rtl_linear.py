@@ -92,9 +92,9 @@ def decode_model_output_bits(out_bits: torch.Tensor, out_fmt_sel: OutputFmtSel) 
 
 class IPTLinearRTLFunction:
     """
-    Functional adapter around InnerProductTreesModel.
+    Functional adapter around the 32×32 Inner Product Trees MXU.
 
-    Assumptions:
+    Assumptions (unchanged from previous model):
       - input activations / weights are quantized to E4M3 before entering the MXU
       - psum is BF16
       - bias is loaded as E4M3 if used in the first tile
@@ -105,7 +105,7 @@ class IPTLinearRTLFunction:
     def __init__(
         self,
         vec_len: int = 32,
-        num_lanes: int = 16,
+        num_lanes: int = 32,
         pipeline_depth: int = 1,
         out_fmt_sel: OutputFmtSel = OutputFmtSel.OutBF16,
     ):
@@ -190,7 +190,6 @@ class IPTLinearRTLFunction:
             prepared_weight_tiles.append((out_base, lane_count, out_tile))
 
         # Pre-convert weight tiles to numpy arrays so __call__ does not rebuild them.
-        # wbuf_np_tiles[out_tile_idx][k_tile_idx] -> (num_lanes, vec_len) uint8
         wbuf_np_tiles = []
         for _, _, out_tile in prepared_weight_tiles:
             wbuf_np_tiles.append(
@@ -231,7 +230,6 @@ class IPTLinearRTLFunction:
         )
 
         # Build activation tile array: (num_k_tiles, batch, vec_len) uint8.
-        # Axis 0 first so each k_tile slice is C-contiguous.
         x_e4m3_np = float_to_e4m3_bytes(x2).cpu().numpy()  # (batch, in_features)
         acts_tiles = np.zeros((num_k_tiles, batch, vec_len), dtype=np.uint8)
         for k in range(num_k_tiles):
@@ -280,13 +278,13 @@ class IPTLinearRTLFunction:
                     k_tile + 1, num_k_tiles, addend_sel,
                 )
 
-                wbuf = k_wbufs[k_tile]  # (num_lanes, vec_len) uint8, already numpy
+                wbuf = k_wbufs[k_tile]
                 psum_np = compute_lanes_batch(
-                    acts_tiles[k_tile],               # (batch, vec_len) – contiguous
+                    acts_tiles[k_tile],
                     wbuf, wbuf,                       # buf_read_sel=False → wbuf0 used
-                    cur_bias,                         # (num_lanes,) uint8
-                    psum_np,                          # (batch, num_lanes) int32
-                    sexp_arr,                         # (num_lanes,) int32
+                    cur_bias,
+                    psum_np,
+                    sexp_arr,
                     False,
                     addend_sel,
                     np.int32(self.out_fmt_sel.value),
