@@ -1,206 +1,240 @@
-# pi0-inout
+# pi0-quant
 
-Matmul input/output quantization framework for [Pi0Pytorch](https://github.com/Physical-Intelligence/openpi).
+Matmul and vector-op quantization framework for [Pi0Pytorch](https://github.com/Physical-Intelligence/openpi).
 
-Sweeps all 25 `(input_fmt × output_fmt)` combinations across
-`{float32, float16, bfloat16, float8_e4m3, float8_e5m2}`, measures
-per-layer and per-component RMSE, and optionally runs live sim-eval
-benchmarks via the openpi WebSocket protocol.
+Replaces every `nn.Linear` in the model with a `QuantLinear` that simulates
+reduced-precision matmuls, intercepts attention score matmuls, and optionally
+quantizes all vector operations (layernorm, activations, elementwise ops).
+Supports both software format-flag quantization and hardware-accurate functional
+models (e.g. Inner Product Tree simulation).
 
-## What it does
+## What it quantizes
 
-Every `nn.Linear` in the model is replaced in-place with a `QuantLinear`
-that simulates reduced-precision matmuls:
+### Matrix path (linear layers + attention)
+
+Every `nn.Linear` is replaced with `QuantLinear`:
 
 ```
-x_q  = quant(x,    input_fmt)   # activation snapped to input_fmt grid
-W_q  = quant(W,    input_fmt)   # weight snapped to input_fmt grid
-b_q  = quant(b,    input_fmt)   # bias snapped to input_fmt grid
-y    = x_q @ W_q^T + b_q        # accumulated in float32
-out  = quant(y,    output_fmt)  # output snapped to output_fmt grid
+x_q  = quant(x, mx_input_fmt)    # activation snapped to input format
+W_q  = quant(W, mx_input_fmt)    # weight snapped to input format
+b_q  = quant(b, mx_input_fmt)    # bias snapped to input format
+y    = x_q @ W_q^T + b_q         # matmul in original model dtype
+out  = quant(y, mx_output_fmt)   # output snapped to output format
 ```
 
-This is **simulated** quantization — the weights are not stored in
-reduced precision. The cast-and-back trick (`float32 → target → float32`)
-replicates IEEE 754 round-to-nearest-even rounding, giving the same
-numerical values that true hardware quantization would produce.
+Attention score matmuls (`Q@K^T` and `weights@V`) are handled separately
+via `patch_attn_sdpa`, which monkey-patches `F.scaled_dot_product_attention`.
 
-Attention score matmuls (`Q@K^T` and `weights@V`) are fused inside
-`F.scaled_dot_product_attention` and are not `nn.Linear` layers.
-`QuantAttnContext` handles these by temporarily monkey-patching
-`F.scaled_dot_product_attention` for the duration of a forward pass.
+Alternatively, a **functional model** can replace the matmul entirely with a
+hardware-accurate simulation (see [Functional models](#functional-models) below).
 
-RMSE is measured per layer and aggregated across four architectural
-components:
+### Vector path
+
+`patch_vector_ops` installs a `TorchDispatchMode` that intercepts all
+vector operations in the model:
+
+`add`, `sub`, `mul`, `pow`, `div`, `reciprocal`, `sqrt`, `sin`, `cos`,
+`tanh`, `log2`, `exp`, `exp2`, `amax`, `sum`
+
+Each intercepted op has its inputs quantized to `vec_input_fmt` and its
+output quantized to `vec_output_fmt`.
+
+## Architecture components
+
+RMSE is measured per layer and aggregated across four components:
 
 | Component | Layers |
 |---|---|
-| `VISION` | SigLIP ViT encoder (inside PaliGemma) |
-| `LANGUAGE` | Gemma language model (inside PaliGemma) |
-| `ACTION_EXPERT` | Gemma action-expert transformer |
-| `ACTION_HEAD` | Action projection MLPs at the Pi0 root |
+| `vision` | SigLIP ViT encoder (inside PaliGemma) |
+| `language` | Gemma 2.6B language model (inside PaliGemma) |
+| `action_expert` | Gemma 300M action-expert transformer |
+| `action_head` | Action projection MLPs at the Pi0 root |
 
 ## Requirements
 
-- Python ≥ 3.10, PyTorch ≥ 2.1 (for `float8_e4m3fn` / `float8_e5m2` dtypes)
-- The [openpi](https://github.com/Physical-Intelligence/openpi) repository
-  on your Python path (provides `Pi0Pytorch` and the WebSocket server
-  infrastructure)
-- A Pi0 checkpoint converted to safetensors format (see
-  [openpi conversion script](https://github.com/Physical-Intelligence/openpi/blob/main/examples/convert_jax_model_to_pytorch.py))
-- `sim-evals` + Isaac Sim only if you want to run `run_benchmark.py`
-
-### Why `_jax_stubs.py` exists
-
-Several openpi source files (`gemma.py`, `lora.py`, `array_typing.py`,
-`image_tools.py`) import JAX at module level even though Pi0Pytorch itself
-is pure PyTorch. `_jax_stubs.py` injects lightweight pure-Python
-replacements into `sys.modules` before those imports happen, so Pi0Pytorch
-can be loaded in a PyTorch-only environment with no JAX installation.
-
-Call `_jax_stubs.inject()` once, before any openpi import:
-
-```python
-from pi0_inout._jax_stubs import inject
-inject()
-
-from openpi.models.pi0_pytorch import Pi0Pytorch  # now works without JAX
-```
-
-`serve_quant.py` handles this automatically.
-
-## Install
-
-```bash
-git clone https://github.com/chloe-wong/pi0-quant
-cd pi0-quant
-pip install -e .
-```
+- Python ≥ 3.10, PyTorch ≥ 2.1
+- [openpi](https://github.com/Physical-Intelligence/openpi) on your Python path
+- A Pi0 checkpoint in safetensors format
+- `numba` if using `ipt_numba`: `pip install numba`
 
 ## Quick start
 
-### Patch and measure RMSE
+### Run the evaluation script
+
+```bash
+OPENPI_DIR=/path/to/openpi \
+CUDA_VISIBLE_DEVICES=0 \
+python experiments/run_eval.py \
+    --label fp8_mx_only \
+    --mx-input-fmt float8_e4m3 --mx-output-fmt bfloat16 \
+    --checkpoint-dir /path/to/pi05_base \
+    --config pi05_droid_jointpos_polaris
+```
+
+Results are written to `experiments/results/<label>/`:
+- `config.json` — exact parameters used
+- `chronological.csv` — one row per op call in execution order
+- `grouped.csv` — same rows sorted by (component, layer_name)
+- `summary.csv` — per-component aggregate RMSE stats
+
+A top-level `experiments/results/all_runs_summary.csv` accumulates one row
+per run across all configs.
+
+### Common configs
+
+```bash
+# FP8 matmul inputs, FP16 outputs
+python experiments/run_eval.py --label fp8_mx \
+    --mx-input-fmt float8_e4m3 --mx-output-fmt float16
+
+# FP8 matmul + FP8 vector ops
+python experiments/run_eval.py --label fp8_mx_vec \
+    --mx-input-fmt float8_e4m3 --mx-output-fmt float16 \
+    --vec-input-fmt float8_e4m3 --vec-output-fmt float16
+
+# Hardware-accurate IPT simulation (C kernel, ~40 min)
+python experiments/run_eval.py --label ipt_c \
+    --functional-model ipt_c
+
+# Quantize only action components
+python experiments/run_eval.py --label fp8_action_only \
+    --mx-input-fmt float8_e4m3 --mx-output-fmt float16 \
+    --active-groups action_expert,action_head
+```
+
+### Key CLI flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--label` | *(required)* | Output folder name under `results/` |
+| `--mx-input-fmt` | passthrough | Format for matmul inputs |
+| `--mx-output-fmt` | passthrough | Format for matmul outputs |
+| `--functional-model` | — | Hardware sim instead of format flags (mutually exclusive with `--mx-input-fmt`) |
+| `--vec-input-fmt` | passthrough | Format for vector op inputs |
+| `--vec-output-fmt` | passthrough | Format for vector op outputs |
+| `--active-groups` | all | Comma-separated components to quantize |
+| `--n-obs` | 4 | Number of observations to run |
+| `--steps` | 10 | Diffusion steps per observation |
+| `--gpu` | 0 | CUDA device index |
+
+## Functional models
+
+Functional models replace the matmul inside each `QuantLinear` with a
+hardware-accurate simulation. They receive raw `(x, w, b)` tensors and return
+an accumulated result.
+
+Three IPT (Inner Product Tree) variants are built in:
+
+| Name | Description | Speed |
+|---|---|---|
+| `ipt` | Pure Python reference | Very slow (hours) |
+| `ipt_numba` | Parallel Numba JIT kernel | Faster |
+| `ipt_c` | C/ctypes compiled kernel | Fastest (~40 min) |
+
+All three simulate: E4M3 inputs, BF16 partial sums at each accumulation step,
+BF16 output — matching the hardware accumulation model.
+
+### Adding a new functional model
 
 ```python
-from pi0_inout import patch_model, unpatch_model, StatsTracker, QuantFormat
+from pi0_inout.functional_models import register_functional_model
 
-# Load Pi0Pytorch however you normally do it
-model = ...  # Pi0Pytorch instance
+def my_factory(in_features: int, out_features: int):
+    return MyModel(in_features, out_features)
+
+register_functional_model("my_model", my_factory)
+```
+
+Then pass `--functional-model my_model` to `run_eval.py`. Each `QuantLinear`
+gets its own instance (important for per-layer weight caching).
+
+## Programmatic API
+
+```python
+from pi0_inout import (
+    QuantFormat, QuantGroup,
+    StatsTracker,
+    patch_model, unpatch_model,
+    patch_attn_sdpa, unpatch_attn_sdpa,
+)
+from pi0_inout.quant_vector import patch_vector_ops, unpatch_vector_ops
 
 tracker = StatsTracker()
-patch_model(
-    model,
-    input_fmt=QuantFormat.FLOAT8_E4M3,
-    output_fmt=QuantFormat.FLOAT16,
+active  = {QuantGroup.LANGUAGE, QuantGroup.ACTION_EXPERT}
+
+patch_model(model,
+    mx_input_fmt=QuantFormat.FLOAT8_E4M3,
+    mx_output_fmt=QuantFormat.BFLOAT16,
+    tracker=tracker,
+    active_groups=active,
+)
+attn_handles = patch_attn_sdpa(model,
+    active_groups=active,
+    mx_input_fmt=QuantFormat.FLOAT8_E4M3,
+    mx_output_fmt=QuantFormat.BFLOAT16,
     tracker=tracker,
 )
+vec_handles, vec_ctx = patch_vector_ops(model,
+    active_groups=active,
+    vec_input_fmt=QuantFormat.FLOAT8_E4M3,
+    vec_output_fmt=QuantFormat.BFLOAT16,
+)
 
-# Run inference
-with torch.no_grad():
-    actions = model.sample_actions(obs)
+with torch.no_grad(), vec_ctx:
+    actions = model.sample_actions(device, obs, num_steps=10)
 
 tracker.summary().print()
 
-# Restore for the next sweep point
 unpatch_model(model)
+unpatch_attn_sdpa(attn_handles)
+unpatch_vector_ops(vec_handles)
 ```
 
-### Include attention score quantization
+### Using a functional model
 
 ```python
-from pi0_inout import patch_model, QuantAttnContext, StatsTracker, QuantFormat
+from pi0_inout.functional_models import get_functional_model_factory
 
-tracker = StatsTracker()
-patch_model(model, input_fmt=QuantFormat.FLOAT8_E4M3, output_fmt=QuantFormat.FLOAT16,
-            tracker=tracker)
-
-with QuantAttnContext(QuantFormat.FLOAT8_E4M3, QuantFormat.FLOAT16, tracker=tracker):
-    actions = model.sample_actions(obs)
-
-tracker.summary().print()
-```
-
-### Skip specific components
-
-```python
-from pi0_inout import patch_model, Component, QuantFormat
-
-# Quantize everything except the vision tower
-patch_model(
-    model,
-    input_fmt=QuantFormat.FLOAT8_E4M3,
-    output_fmt=QuantFormat.FLOAT32,
-    skip_components={Component.VISION},
+factory = get_functional_model_factory("ipt_c")
+patch_model(model,
+    mx_input_fmt=QuantFormat.BFLOAT16,   # ignored when functional_model_factory set
+    mx_output_fmt=QuantFormat.BFLOAT16,
+    tracker=tracker,
+    functional_model_factory=factory,
 )
 ```
-
-### Sweep all 25 format pairs programmatically
-
-```python
-from pi0_inout import patch_model, unpatch_model, StatsTracker, QuantFormat
-from pi0_inout.quant_types import sweep_pairs
-
-for input_fmt, output_fmt in sweep_pairs():
-    tracker = StatsTracker()
-    patch_model(model, input_fmt=input_fmt, output_fmt=output_fmt, tracker=tracker)
-
-    with torch.no_grad():
-        actions = model.sample_actions(obs)
-
-    report = tracker.summary()
-    report.print()
-    unpatch_model(model)
-```
-
-## Serving over WebSocket
-
-`serve_quant.py` is a drop-in replacement for openpi's `serve_policy.py`
-that loads Pi0Pytorch with configurable quantization and serves it over
-the openpi WebSocket protocol (msgpack + websockets). On shutdown it writes
-per-layer RMSE stats to `--stats-output`.
-
-```bash
-python pi0_inout/serve_quant.py \
-    --openpi-dir /path/to/openpi \
-    --checkpoint-dir /path/to/safetensors_checkpoint \
-    --config pi05_droid_jointpos_polaris \
-    --input-fmt float8_e4m3 \
-    --output-fmt float16 \
-    --port 8003 \
-    --gpu 0
-```
-
-## Full benchmark sweep
-
-`run_benchmark.py` orchestrates a sweep of all 25 format pairs, spawning
-a `serve_quant.py` server and running `sim-evals/run_eval.py` for each
-combination. Results (RMSE stats + success rate + videos) are written to
-`--output-dir`.
-
-```bash
-python pi0_inout/run_benchmark.py \
-    --sim-evals-dir /path/to/sim-evals \
-    --openpi-dir /path/to/openpi \
-    --checkpoint-dir /path/to/safetensors_checkpoint \
-    --config pi05_droid_jointpos_polaris \
-    --episodes 5 --scenes 1 2 3 \
-    --output-dir ./results
-```
-
-Run `python pi0_inout/run_benchmark.py --help` for all options, including
-`--input-fmts` / `--output-fmts` to restrict the sweep and `--resume` to
-continue an interrupted run.
 
 ## Package layout
 
 ```
 pi0_inout/
-├── quant_types.py     # QuantFormat enum, quant(), sweep_pairs()
-├── quant_linear.py    # QuantLinear: drop-in nn.Linear replacement
-├── model_patcher.py   # patch_model(), unpatch_model(), QuantAttnContext
-├── stats_tracker.py   # StatsTracker: per-layer Welford RMSE accumulator
-├── eval_harness.py    # run_quantization_eval(), run_sweep() (no WebSocket needed)
-├── serve_quant.py     # WebSocket server with quantized Pi0Pytorch
-├── run_benchmark.py   # Full sweep orchestrator (spawns server + sim-evals)
-└── _jax_stubs.py      # Stub modules so Pi0Pytorch loads without JAX
+├── quant_types.py         # QuantFormat enum, quant()
+├── quant_linear.py        # QuantLinear: drop-in nn.Linear replacement
+├── quant_vector.py        # VectorQuantMode: TorchDispatchMode for vector ops
+├── model_patcher.py       # patch_model(), unpatch_model(), patch_attn_sdpa()
+├── functional_models.py   # Registry for functional model factories
+├── stats_tracker.py       # StatsTracker: per-layer Welford RMSE accumulator
+├── _dispatch_guards.py    # Shared re-entrancy guard (quant_linear + quant_vector)
+├── eval_harness.py        # Lower-level eval utilities
+├── serve_quant.py         # WebSocket server with quantized Pi0Pytorch
+├── run_benchmark.py       # Full sweep orchestrator
+└── _jax_stubs.py          # Stub modules so Pi0Pytorch loads without JAX
+
+funct_models_ipt/
+├── python_ipt_base/       # Pure Python IPT ("ipt")
+├── ipt_numba/             # Numba JIT IPT ("ipt_numba")
+└── ipt_c/                 # C/ctypes IPT ("ipt_c")
+
+func_models_sa/            # Systolic array functional models (in progress)
+
+experiments/
+└── run_eval.py            # Main evaluation runner
 ```
+
+### Why `_jax_stubs.py` exists
+
+Several openpi source files import JAX at module level even though Pi0Pytorch
+is pure PyTorch. `_jax_stubs.py` injects lightweight replacements into
+`sys.modules` before those imports happen. `serve_quant.py` handles this
+automatically; call `_jax_stubs.inject()` manually if loading Pi0Pytorch
+directly.
