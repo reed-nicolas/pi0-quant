@@ -374,6 +374,7 @@ def main() -> None:
 
     parser.add_argument("--n-obs",  type=int, default=1)
     parser.add_argument("--steps",  type=int, default=10)
+    parser.add_argument("--seed",   type=int, default=0)
 
     parser.add_argument("--extra-bits-min",  type=int, default=0,
                         help="Minimum extra_bits value (inclusive, default: 0)")
@@ -459,9 +460,9 @@ def main() -> None:
         tokenizer_path=args.tokenizer_path,
     )
 
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(args.seed)
     observations = [_make_dummy_obs(rng) for _ in range(args.n_obs)]
-    print(f"Observations: {args.n_obs}  steps: {args.steps}")
+    print(f"Observations: {args.n_obs}  steps: {args.steps}  seed: {args.seed}")
 
     run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir_name = f"{run_ts}_ipt_numba_exp_steps{args.steps}"

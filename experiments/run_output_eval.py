@@ -352,6 +352,7 @@ def main() -> None:
 
     parser.add_argument("--n-obs",  type=int, default=4)
     parser.add_argument("--steps",  type=int, default=10)
+    parser.add_argument("--seed",   type=int, default=0)
 
     mx_group = parser.add_mutually_exclusive_group()
     mx_group.add_argument("--functional-model", metavar="NAME",
@@ -431,7 +432,7 @@ def main() -> None:
         tokenizer_path=args.tokenizer_path,
     )
 
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(args.seed)
     observations = [_make_dummy_obs(rng) for _ in range(args.n_obs)]
     print(f"Observations: {args.n_obs}  steps: {args.steps}")
 
