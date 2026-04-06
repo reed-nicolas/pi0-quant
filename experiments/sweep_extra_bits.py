@@ -434,6 +434,8 @@ def main() -> None:
     # ── Device / model ────────────────────────────────────────────────────────
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     print(f"device = {device}")
+    torch.manual_seed(args.seed)
+    print(f"Diffusion noise seed: {args.seed} (torch.manual_seed — fixed for reproducibility)")
 
     from pi0_inout.serve_quant import load_pi0_pytorch, _get_model_config
     _get_model_config(args.config)
