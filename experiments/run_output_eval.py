@@ -242,7 +242,7 @@ _ACTION_RMSE_FIELDS = ["obs_idx", "rmse", "ref_rms", "rel_rmse"]
 _OUTPUT_SUMMARY_FIELDS = [
     "timestamp", "label", "overall_rmse", "rel_rmse", "elapsed_seconds", "elapsed_human",
     "mx_input", "mx_output", "vec_input", "vec_output", "functional_model", "active_groups",
-    "n_obs", "steps",
+    "n_obs", "steps", "command",
 ]
 
 
@@ -299,7 +299,8 @@ def _append_output_summary(
     overall_rmse: float,
     overall_ref_rms: float,
 ) -> None:
-    path = results_dir / "all_runs_output_summary.csv"
+    path = results_dir / "run_output_eval" / "all_runs_output_summary.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists()
 
     mp = config_record["matrix_path"]
@@ -323,6 +324,7 @@ def _append_output_summary(
         "active_groups":    "|".join(config_record.get("active_groups", [])),
         "n_obs":            config_record["n_obs"],
         "steps":            config_record["steps"],
+        "command":          config_record.get("command", ""),
     }
     with open(path, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=_OUTPUT_SUMMARY_FIELDS)
@@ -452,6 +454,7 @@ def main() -> None:
             "vec_input_fmt":  args.vec_input_fmt,
             "vec_output_fmt": args.vec_output_fmt,
         },
+        "command": " ".join(sys.argv),
     }
 
     # ── Run ───────────────────────────────────────────────────────────────────
@@ -473,8 +476,12 @@ def main() -> None:
     config_record["elapsed_seconds"] = round(elapsed_s, 2)
 
     # ── Write outputs ─────────────────────────────────────────────────────────
-    out_dir = Path(args.results_dir) / args.label
+    run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fm = args.functional_model or "passthrough"
+    run_dir_name = f"{run_ts}_{fm}_steps{args.steps}"
+    out_dir = Path(args.results_dir) / "run_output_eval" / run_dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "command.txt").write_text(" ".join(sys.argv) + "\n")
 
     (out_dir / "config.json").write_text(json.dumps(config_record, indent=2, default=str))
 
@@ -494,7 +501,7 @@ def main() -> None:
     print(f"\n{'='*60}")
     print(f"Elapsed:      {elapsed_td} ({elapsed_s:.1f}s)")
     print(f"Results:      {out_dir}")
-    print(f"Top-level summary: {Path(args.results_dir) / 'all_runs_output_summary.csv'}")
+    print(f"Top-level summary: {Path(args.results_dir) / 'run_output_eval' / 'all_runs_output_summary.csv'}")
     print(f"\nOverall action RMSE:     {overall_rmse:.6e}")
     print(f"Relative action RMSE:    {rel_rmse:.6e}  (rmse / rms(baseline))")
     print(f"\nPer-observation breakdown:")

@@ -306,7 +306,7 @@ def _write_sweep_summary(path: Path, rows: list[dict]) -> None:
 _OUTPUT_SUMMARY_FIELDS = [
     "timestamp", "label", "overall_rmse", "rel_rmse", "elapsed_seconds", "elapsed_human",
     "mx_input", "mx_output", "vec_input", "vec_output", "functional_model", "active_groups",
-    "n_obs", "steps",
+    "n_obs", "steps", "command",
 ]
 
 
@@ -324,8 +324,10 @@ def _append_output_summary(
     active_groups: set[QuantGroup],
     n_obs: int,
     steps: int,
+    command: str,
 ) -> None:
-    path = results_dir / "all_runs_output_summary.csv"
+    path = results_dir / "sweep_extra_bits" / "all_runs_output_summary.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists()
     elapsed_td = str(datetime.timedelta(seconds=int(elapsed_s))) if math.isfinite(elapsed_s) else ""
     rel_rmse = overall_rmse / overall_ref_rms if overall_ref_rms > 0 else float("nan")
@@ -344,6 +346,7 @@ def _append_output_summary(
         "active_groups":    "|".join(g.value for g in active_groups),
         "n_obs":            n_obs,
         "steps":            steps,
+        "command":          command,
     }
     with open(path, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=_OUTPUT_SUMMARY_FIELDS)
@@ -460,8 +463,11 @@ def main() -> None:
     observations = [_make_dummy_obs(rng) for _ in range(args.n_obs)]
     print(f"Observations: {args.n_obs}  steps: {args.steps}")
 
-    out_dir = Path(args.results_dir) / args.label
+    run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir_name = f"{run_ts}_ipt_numba_exp_steps{args.steps}"
+    out_dir = Path(args.results_dir) / "sweep_extra_bits" / run_dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "command.txt").write_text(" ".join(sys.argv) + "\n")
 
     # ── Baseline pass (once) ──────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -529,6 +535,7 @@ def main() -> None:
             active_groups=active_groups,
             n_obs=args.n_obs,
             steps=args.steps,
+            command=" ".join(sys.argv),
         )
 
         print(f"  extra_bits={extra_bits:>3}  rmse={overall_rmse:.4e}  rel_rmse={rel_rmse:.4e}  t={elapsed_s:.1f}s")
@@ -543,7 +550,7 @@ def main() -> None:
     print(f"Sweep complete  total={datetime.timedelta(seconds=int(total_elapsed))}")
     print(f"Results dir:    {out_dir}")
     print(f"Sweep summary:  {sweep_csv}")
-    print(f"Top-level:      {Path(args.results_dir) / 'all_runs_output_summary.csv'}")
+    print(f"Top-level:      {Path(args.results_dir) / 'sweep_extra_bits' / 'all_runs_output_summary.csv'}")
     print(f"\n  {'extra_bits':>10}  {'overall_rmse':>14}  {'rel_rmse':>12}  {'elapsed_s':>10}")
     print(f"  {'-'*10}  {'-'*14}  {'-'*12}  {'-'*10}")
     for row in sweep_rows:
