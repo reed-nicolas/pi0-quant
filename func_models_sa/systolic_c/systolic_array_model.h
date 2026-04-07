@@ -41,12 +41,12 @@
 typedef struct
 {
     int rows; /* default 32 */
-    int cols; /* default 16 */
+    int cols; /* default 32 */
 } SystolicArrayParams;
 
 static inline SystolicArrayParams SA_default_params(void)
 {
-    SystolicArrayParams p = {.rows = 32, .cols = 16};
+    SystolicArrayParams p = {.rows = 32, .cols = 32};
     return p;
 }
 

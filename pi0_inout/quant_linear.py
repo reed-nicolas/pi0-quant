@@ -66,6 +66,7 @@ class QuantLinear(nn.Module):
         tracker: Optional[StatsTracker] = None,
         noise_injection: float = 0.0,
         functional_model=None,
+        reference_store=None,
     ) -> None:
         super().__init__()
 
@@ -90,13 +91,18 @@ class QuantLinear(nn.Module):
         self.layer_name      = layer_name
         self.tracker         = tracker
 
-        self.in_features  = linear.in_features
-        self.out_features = linear.out_features
+        self.in_features     = linear.in_features
+        self.out_features    = linear.out_features
+        self.reference_store = reference_store
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
         w = self.weight
         b = self.bias
+        # Always operate in the weight dtype (e.g. bfloat16). Some activations
+        # arrive as float32 (timestep embeddings, state inputs); casting here
+        # matches what the reference F.linear does and ensures passthrough gives 0 RMSE.
+        dtype = w.dtype
+        x = x.to(dtype)
 
         if self.functional_model is not None:
             # Functional model handles quantization internally; pass tensors as-is.
@@ -128,13 +134,15 @@ class QuantLinear(nn.Module):
             _in_quant_guard.active = True
             try:
                 with torch.no_grad():
-                    x_ref = x.to(w.dtype) if x.dtype != w.dtype else x
-                    y_ref = F.linear(x_ref, w, b)
+                    y_ref = F.linear(x, w, b)
+                    y_clean_ref = (self.reference_store.get(self.layer_name)
+                                   if self.reference_store is not None else None)
                     self.tracker.record(
                         name=self.layer_name,
                         component=self.component,
                         y_fp=y_ref,
                         y_quant=y_out,
+                        y_clean_ref=y_clean_ref,
                     )
             finally:
                 _in_quant_guard.active = False

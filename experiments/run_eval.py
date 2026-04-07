@@ -4,9 +4,26 @@ run_eval.py
 Flexible evaluation runner: patches the Pi0 model with any combination of
 quantization settings and logs per-layer RMSE to a results folder.
 
+Op scope selection — --ops OP1,OP2,...  (default: linear)
+  linear      nn.Linear weight-activation matmuls: all Q/K/V/O projections,
+              MLP gate/up/down_proj, and action-head projections.
+  conv2d      nn.Conv2d patch embedding in the SigLIP vision encoder (one layer).
+  attention   Attention score matmuls Q@K^T and attn_weights@V:
+                - SigLIP ViT: via F.scaled_dot_product_attention (patch_attn_sdpa)
+                - Gemma language model: via eager_attention_forward (patch_attn_eager)
+                - Gemma action expert: via eager_attention_forward (patch_attn_eager)
+                - Co-attention (language + expert joint): same eager path
+              Softmax runs in BF16; attn_weights are always quantized to FP8
+              E4M3 before the AV matmul (hardware faithful).
+
+  Together, --ops linear,conv2d,attention covers all active matmuls in Pi0
+  inference. The only excluded ops are the RoPE frequency precomputation
+  (no learned weights, negligible FLOPs) and lm_head (never called in Pi0).
+
 Matrix path — choose one:
   --mx-input-fmt / --mx-output-fmt   software format-flag quantization
-  --functional-model NAME             hardware-accurate simulation (e.g. "ipt")
+  --functional-model NAME             hardware-accurate simulation
+                                      available: ipt, ipt_numba, ipt_c, systolic_c
   (mutually exclusive; default is passthrough = bfloat16/bfloat16)
 
 Vector path (independent of matrix path):
@@ -17,25 +34,28 @@ Component selection:
 
 Output — written to <results-dir>/<label>/:
   config.json        exact parameters used
-  chronological.csv  one row per op call in execution order
+  chronological.csv  one row per op call in execution order (local + cumulative RMSE)
   grouped.csv        same rows sorted by (component, layer_name)
   summary.csv        per-component aggregate stats (mx and vec separately)
+  worst_layers.csv   top-20 layers by local rel RMSE across all components
 
 Usage:
+    # IPT numba functional model, all op scopes:
     OPENPI_DIR=/scratch/chloe.wong/openpi \\
     CUDA_VISIBLE_DEVICES=0 \\
     /scratch/chloe.wong/envs/pi0/bin/python experiments/run_eval.py \\
-        --label fp8_mx_only \\
-        --mx-input-fmt float8_e4m3 --mx-output-fmt bfloat16 \\
-        --checkpoint-dir /scratch/chloe.wong/data/pi05_base \\
-        --config pi05_droid_jointpos_polaris
+        --label ipt_numba_all \\
+        --functional-model ipt_numba \\
+        --ops linear,conv2d,attention \\
+        --n-obs 4 --steps 10 \\
+        --results-dir experiments/results/my_run
 
-    # IPT functional model for matmuls, FP8 for vector ops:
+    # Software FP8 format flags, linear only:
     OPENPI_DIR=/scratch/chloe.wong/openpi \\
     /scratch/chloe.wong/envs/pi0/bin/python experiments/run_eval.py \\
-        --label ipt_vec_fp8 \\
-        --functional-model ipt \\
-        --vec-input-fmt float8_e4m3 --vec-output-fmt bfloat16
+        --label fp8_linear \\
+        --mx-input-fmt float8_e4m3 --mx-output-fmt bfloat16 \\
+        --ops linear
 """
 
 from __future__ import annotations
@@ -66,10 +86,13 @@ from pi0_inout import (
     StatsTracker,
     patch_model, unpatch_model,
     patch_attn_sdpa, unpatch_attn_sdpa,
+    patch_attn_eager, unpatch_attn_eager,
     patch_vector_ops, unpatch_vector_ops,
     get_functional_model_factory, list_functional_models,
     set_fp8_mode,
 )
+from pi0_inout.model_patcher import OpScope, ALL_SCOPES, patch_conv2d, unpatch_conv2d
+from pi0_inout.reference_store import ReferenceStore
 
 PASSTHROUGH = "passthrough"
 
@@ -117,25 +140,37 @@ def _rel_rmse(rmse: float, ref_rms: float) -> float:
 # CSV writers
 # ---------------------------------------------------------------------------
 
-_CHRON_FIELDS = ["seq", "tag", "layer_name", "component", "rmse", "ref_rms", "rel_rmse"]
+_CHRON_FIELDS = [
+    "seq", "tag", "layer_name", "component",
+    "rmse", "ref_rms", "rel_rmse",
+    "cumulative_rmse", "cumulative_rel_rmse",
+]
 _SUMMARY_FIELDS = [
     "tag", "component", "n_layers",
     "mean_rmse", "std_rmse", "max_rmse", "min_rmse",
-    "mean_rel_rmse", "total_calls",
+    "mean_rel_rmse", "std_rel_rmse", "max_rel_rmse", "max_rel_rmse_layer",
+    "total_calls",
+    "mean_cumulative_rmse", "mean_cumulative_rel_rmse",
 ]
+
+_WORST_LAYERS_FIELDS = ["rank", "tag", "component", "layer_name", "rel_rmse", "rmse", "n_calls"]
 
 
 def _calls_to_rows(calls: list[dict], tag: str) -> list[dict]:
     rows = []
     for rec in calls:
+        cum_rmse = rec.get("cumulative_rmse", float("nan"))
+        cum_ref  = rec.get("cumulative_ref_rms", float("nan"))
         rows.append({
-            "seq":        rec["seq"],
-            "tag":        tag,
-            "layer_name": rec["name"],
-            "component":  rec["component"],
-            "rmse":       rec["rmse"],
-            "ref_rms":    rec["ref_rms"],
-            "rel_rmse":   _rel_rmse(rec["rmse"], rec["ref_rms"]),
+            "seq":                 rec["seq"],
+            "tag":                 tag,
+            "layer_name":          rec["name"],
+            "component":           rec["component"],
+            "rmse":                rec["rmse"],
+            "ref_rms":             rec["ref_rms"],
+            "rel_rmse":            _rel_rmse(rec["rmse"], rec["ref_rms"]),
+            "cumulative_rmse":     cum_rmse,
+            "cumulative_rel_rmse": _rel_rmse(cum_rmse, cum_ref),
         })
     return rows
 
@@ -160,6 +195,30 @@ def _write_grouped(path: Path, mx_calls: list[dict], vec_calls: list[dict]) -> N
         w.writerows(all_rows)
 
 
+def _write_worst_layers(path: Path, mx_tracker: StatsTracker, vec_tracker: StatsTracker, top_n: int = 10) -> None:
+    """Write top-N worst layers by rel_rmse across all components and tags."""
+    rows = []
+    for tag, tracker in [("mx", mx_tracker), ("vec", vec_tracker)]:
+        for layer in tracker.layer_rows():
+            rel = layer.get("rel_rmse", float("nan"))
+            if math.isfinite(rel):
+                rows.append({"tag": tag, **layer})
+    rows.sort(key=lambda r: r["rel_rmse"], reverse=True)
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_WORST_LAYERS_FIELDS)
+        w.writeheader()
+        for rank, r in enumerate(rows[:top_n], 1):
+            w.writerow({
+                "rank":       rank,
+                "tag":        r["tag"],
+                "component":  r["component"],
+                "layer_name": r["layer"],
+                "rel_rmse":   r["rel_rmse"],
+                "rmse":       r["rmse"],
+                "n_calls":    r["n_calls"],
+            })
+
+
 def _write_summary(path: Path, mx_tracker: StatsTracker, vec_tracker: StatsTracker) -> None:
     rows = []
     for tag, tracker in [("mx", mx_tracker), ("vec", vec_tracker)]:
@@ -176,11 +235,18 @@ _COMPONENTS = ["vision", "language", "action_expert", "action_head"]
 _TOP_LEVEL_FIELDS = (
     ["timestamp", "label", "elapsed_seconds", "elapsed_human",
      "mx_input", "mx_output", "vec_input", "vec_output",
-     "functional_model", "active_groups"]
-    + [f"mx_{c}_mean_rmse"     for c in _COMPONENTS]
-    + [f"mx_{c}_mean_rel_rmse" for c in _COMPONENTS]
-    + [f"vec_{c}_mean_rmse"     for c in _COMPONENTS]
-    + [f"vec_{c}_mean_rel_rmse" for c in _COMPONENTS]
+     "functional_model", "active_groups", "ops"]
+    + [f"mx_{c}_mean_rmse"                for c in _COMPONENTS]
+    + [f"mx_{c}_mean_rel_rmse"            for c in _COMPONENTS]
+    + [f"mx_{c}_std_rel_rmse"             for c in _COMPONENTS]
+    + [f"mx_{c}_max_rel_rmse"             for c in _COMPONENTS]
+    + [f"mx_{c}_max_rel_rmse_layer"       for c in _COMPONENTS]
+    + [f"mx_{c}_mean_cumulative_rel_rmse" for c in _COMPONENTS]
+    + [f"vec_{c}_mean_rmse"               for c in _COMPONENTS]
+    + [f"vec_{c}_mean_rel_rmse"           for c in _COMPONENTS]
+    + [f"vec_{c}_std_rel_rmse"            for c in _COMPONENTS]
+    + [f"vec_{c}_max_rel_rmse"            for c in _COMPONENTS]
+    + [f"vec_{c}_max_rel_rmse_layer"      for c in _COMPONENTS]
 )
 
 
@@ -216,14 +282,22 @@ def _append_top_level_summary(
         "vec_output":      vp.get("vec_output_fmt") or "passthrough",
         "functional_model": mp.get("functional_model") or "",
         "active_groups":   "|".join(config_record.get("active_groups", [])),
+        "ops":             "|".join(config_record.get("ops", [])),
     }
     for c in _COMPONENTS:
         mx_row  = comp_lookup["mx"].get(c,  {})
         vec_row = comp_lookup["vec"].get(c, {})
-        row[f"mx_{c}_mean_rmse"]      = mx_row.get("mean_rmse",     float("nan"))
-        row[f"mx_{c}_mean_rel_rmse"]  = mx_row.get("mean_rel_rmse", float("nan"))
-        row[f"vec_{c}_mean_rmse"]     = vec_row.get("mean_rmse",     float("nan"))
-        row[f"vec_{c}_mean_rel_rmse"] = vec_row.get("mean_rel_rmse", float("nan"))
+        row[f"mx_{c}_mean_rmse"]                = mx_row.get("mean_rmse",                float("nan"))
+        row[f"mx_{c}_mean_rel_rmse"]            = mx_row.get("mean_rel_rmse",            float("nan"))
+        row[f"mx_{c}_std_rel_rmse"]             = mx_row.get("std_rel_rmse",             float("nan"))
+        row[f"mx_{c}_max_rel_rmse"]             = mx_row.get("max_rel_rmse",             float("nan"))
+        row[f"mx_{c}_max_rel_rmse_layer"]       = mx_row.get("max_rel_rmse_layer",       "")
+        row[f"mx_{c}_mean_cumulative_rel_rmse"] = mx_row.get("mean_cumulative_rel_rmse", float("nan"))
+        row[f"vec_{c}_mean_rmse"]               = vec_row.get("mean_rmse",               float("nan"))
+        row[f"vec_{c}_mean_rel_rmse"]           = vec_row.get("mean_rel_rmse",           float("nan"))
+        row[f"vec_{c}_std_rel_rmse"]            = vec_row.get("std_rel_rmse",            float("nan"))
+        row[f"vec_{c}_max_rel_rmse"]            = vec_row.get("max_rel_rmse",            float("nan"))
+        row[f"vec_{c}_max_rel_rmse_layer"]      = vec_row.get("max_rel_rmse_layer",      "")
 
     with open(path, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=_TOP_LEVEL_FIELDS)
@@ -295,6 +369,7 @@ def run(
     observations: list,
     device: torch.device,
     active_groups: set[QuantGroup],
+    op_scopes: set[OpScope],
     mx_input_fmt: Optional[QuantFormat],
     mx_output_fmt: Optional[QuantFormat],
     vec_input_fmt: Optional[QuantFormat],
@@ -320,6 +395,50 @@ def run(
     if functional_model_name is not None:
         fm_factory = get_functional_model_factory(functional_model_name)
 
+    # ── Capture reference (unpatched) layer outputs for cumulative RMSE ──────
+    ref_store = ReferenceStore()
+    layer_names = {
+        name for name, m in model.named_modules()
+        if type(m) is nn.Linear or type(m) is nn.Conv2d
+    }
+    ref_hooks = ref_store.register_hooks(model, layer_names)
+
+    # Also capture eager_attention_forward and SDPA outputs when attention is active.
+    _ref_attn_handles = []
+    if OpScope.ATTENTION in op_scopes:
+        import torch.nn.functional as _F_ref
+        from transformers.models.gemma import modeling_gemma as _mg_ref
+
+        _ref_orig_eager = _mg_ref.eager_attention_forward
+        _ref_orig_sdpa  = _F_ref.scaled_dot_product_attention
+
+        def _ref_capture_eager(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+            out, w = _ref_orig_eager(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
+            ref_store.capture("eager_attn", out)
+            return out, w
+
+        def _ref_capture_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+            out = _ref_orig_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale)
+            ref_store.capture("sdpa", out)
+            return out
+
+        _mg_ref.eager_attention_forward    = _ref_capture_eager
+        _F_ref.scaled_dot_product_attention = _ref_capture_sdpa
+
+    with torch.no_grad():
+        for i, obs in enumerate(observations):
+            torch.manual_seed(i)
+            ref_store.reset_counters()
+            model.sample_actions(str(device), obs, num_steps=num_steps)
+    for h in ref_hooks:
+        h.remove()
+
+    if OpScope.ATTENTION in op_scopes:
+        _mg_ref.eager_attention_forward    = _ref_orig_eager
+        _F_ref.scaled_dot_product_attention = _ref_orig_sdpa
+
+    print(f"[reference_store] Captured {len(ref_store)} reference layer outputs.")
+
     patch_model(
         model,
         mx_input_fmt=_mx_in,
@@ -327,14 +446,40 @@ def run(
         tracker=mx_tracker,
         active_groups=active_groups,
         functional_model_factory=fm_factory,
+        op_scopes=op_scopes,
+        reference_store=ref_store,
     )
-    attn_handles = patch_attn_sdpa(
-        model,
-        active_groups=active_groups,
-        mx_input_fmt=_mx_in,
-        mx_output_fmt=_mx_out,
-        tracker=mx_tracker,
-    )
+    if OpScope.CONV2D in op_scopes:
+        patch_conv2d(
+            model,
+            mx_input_fmt=_mx_in,
+            mx_output_fmt=_mx_out,
+            tracker=mx_tracker,
+            active_groups=active_groups,
+            functional_model_factory=fm_factory,
+            reference_store=ref_store,
+        )
+    if OpScope.ATTENTION in op_scopes:
+        attn_handles = patch_attn_sdpa(
+            model,
+            active_groups=active_groups,
+            mx_input_fmt=_mx_in,
+            mx_output_fmt=_mx_out,
+            tracker=mx_tracker,
+            functional_model_factory=fm_factory,
+            reference_store=ref_store,
+        )
+        patch_attn_eager(
+            model,
+            active_groups=active_groups,
+            mx_input_fmt=_mx_in,
+            mx_output_fmt=_mx_out,
+            tracker=mx_tracker,
+            functional_model_factory=fm_factory,
+            reference_store=ref_store,
+        )
+    else:
+        attn_handles = []
     vec_handles, vec_ctx = patch_vector_ops(
         model,
         active_groups=active_groups,
@@ -351,6 +496,7 @@ def run(
         for i, obs in enumerate(observations):
             print(f"\n[obs {i + 1}/{n_obs}] running ({num_steps} diffusion steps)...", flush=True)
             obs_t0 = time.monotonic()
+            torch.manual_seed(i)
             model.sample_actions(str(device), obs, num_steps=num_steps)
             obs_elapsed = time.monotonic() - obs_t0
             print(f"[obs {i + 1}/{n_obs}] done in {obs_elapsed:.1f}s", flush=True)
@@ -362,7 +508,10 @@ def run(
 
     stop_heartbeat.set()
     unpatch_model(model)
+    if OpScope.CONV2D in op_scopes:
+        unpatch_conv2d(model)
     unpatch_attn_sdpa(attn_handles)
+    unpatch_attn_eager()
     unpatch_vector_ops(vec_handles)
 
     return mx_tracker, vec_tracker
@@ -410,6 +559,13 @@ def main() -> None:
     parser.add_argument("--vec-output-fmt", metavar="FMT", default=PASSTHROUGH,
                         help="Format for vector op outputs. Use 'passthrough' for no-op.")
 
+    # Op scope selection
+    all_scope_names = [s.value for s in ALL_SCOPES]
+    parser.add_argument("--ops", metavar="OP1,OP2,...",
+                        default="linear",
+                        help=f"Comma-separated op types to apply quantization to. "
+                             f"Choices: {all_scope_names}  (default: linear)")
+
     # Component selection
     all_group_names = [g.value for g in QuantGroup]
     parser.add_argument("--active-groups", metavar="G1,G2,...",
@@ -429,6 +585,14 @@ def main() -> None:
     # ── Validate ────────────────────────────────────────────────────────────
     if args.functional_model is not None and args.mx_output_fmt != PASSTHROUGH:
         parser.error("--mx-output-fmt has no effect with --functional-model")
+
+    op_scopes: set[OpScope] = set()
+    for s in args.ops.split(","):
+        s = s.strip()
+        try:
+            op_scopes.add(OpScope(s))
+        except ValueError:
+            parser.error(f"Unknown op scope '{s}'. Choices: {all_scope_names}")
 
     active_groups: set[QuantGroup] = set()
     for g in args.active_groups.split(","):
@@ -469,6 +633,7 @@ def main() -> None:
         "gpu":                 args.gpu,
         "fp8_mode":            args.fp8_mode,
         "active_groups":       [g.value for g in active_groups],
+        "ops":                 [s.value for s in op_scopes],
         "matrix_path": {
             "functional_model": args.functional_model,
             "mx_input_fmt":     args.mx_input_fmt,
@@ -488,6 +653,7 @@ def main() -> None:
         observations=observations,
         device=device,
         active_groups=active_groups,
+        op_scopes=op_scopes,
         mx_input_fmt=mx_input_fmt,
         mx_output_fmt=mx_output_fmt,
         vec_input_fmt=vec_input_fmt,
@@ -518,6 +684,11 @@ def main() -> None:
     _write_summary(
         out_dir / "summary.csv",
         mx_tracker, vec_tracker,
+    )
+    _write_worst_layers(
+        out_dir / "worst_layers.csv",
+        mx_tracker, vec_tracker,
+        top_n=20,
     )
 
     _append_top_level_summary(

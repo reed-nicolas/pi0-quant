@@ -153,18 +153,24 @@ class ComponentStats:
     max_rmse: float
     min_rmse: float
     mean_rel_rmse: float  # mean of per-layer relative RMSE (rmse / rms_fp32)
+    std_rel_rmse: float   # std of per-layer relative RMSE
+    max_rel_rmse: float   # worst-case layer relative RMSE
+    max_rel_rmse_layer: str  # name of the worst-case layer
     total_calls: int
 
     def to_dict(self) -> dict:
         return {
-            "component":    self.component.value,
-            "n_layers":     self.n_layers,
-            "mean_rmse":    self.mean_rmse,
-            "std_rmse":     self.std_rmse,
-            "max_rmse":     self.max_rmse,
-            "min_rmse":     self.min_rmse,
-            "mean_rel_rmse": self.mean_rel_rmse,
-            "total_calls":  self.total_calls,
+            "component":          self.component.value,
+            "n_layers":           self.n_layers,
+            "mean_rmse":          self.mean_rmse,
+            "std_rmse":           self.std_rmse,
+            "max_rmse":           self.max_rmse,
+            "min_rmse":           self.min_rmse,
+            "mean_rel_rmse":      self.mean_rel_rmse,
+            "std_rel_rmse":       self.std_rel_rmse,
+            "max_rel_rmse":       self.max_rel_rmse,
+            "max_rel_rmse_layer": self.max_rel_rmse_layer,
+            "total_calls":        self.total_calls,
         }
 
 
@@ -217,11 +223,19 @@ class StatsTracker:
         component: Component,
         y_fp: torch.Tensor,
         y_quant: torch.Tensor,
+        y_clean_ref: torch.Tensor | None = None,
     ) -> None:
-        """Called by QuantLinear.forward() after each matmul."""
+        """
+        Called by QuantLinear.forward() after each matmul.
+
+        y_fp:        local reference — F.linear(x, w, b) with the same (possibly
+                     corrupted) x that arrived at this layer.  Measures local error.
+        y_quant:     this layer's quantized output.
+        y_clean_ref: optional — output captured from the unpatched model at this
+                     layer with fully clean activations.  When provided, enables
+                     cumulative (end-to-end propagated) RMSE measurement.
+        """
         if name not in self._layers:
-            # Auto-register if not pre-registered.
-            # 0-D scalar outputs (e.g. from sum/amax reductions) have no feature dim.
             feat = y_quant.shape[-1] if y_quant.dim() > 0 else 1
             self._layers[name] = LayerStats(
                 name=name,
@@ -239,13 +253,27 @@ class StatsTracker:
             mse    = diff.pow(2).mean().item()
             fp_ms  = y_fp_f.pow(2).mean().item()
             q_ms   = y_q_f.pow(2).mean().item()
+
+            # Cumulative RMSE — compares patched output against clean reference
+            if y_clean_ref is not None:
+                y_cr_f   = y_clean_ref.float().to(y_q_f.device)
+                cum_mse  = (y_cr_f - y_q_f).pow(2).mean().item()
+                cum_fp_ms = y_cr_f.pow(2).mean().item()
+                cumulative_rmse    = math.sqrt(max(cum_mse, 0.0))
+                cumulative_ref_rms = math.sqrt(max(cum_fp_ms, 0.0))
+            else:
+                cumulative_rmse    = float("nan")
+                cumulative_ref_rms = float("nan")
+
         self.calls.append({
-            "seq":         self._seq,
-            "name":        name,
-            "component":   component.value if isinstance(component, Component) else str(component),
-            "rmse":        math.sqrt(max(mse, 0.0)),
-            "ref_rms":     math.sqrt(max(fp_ms, 0.0)),
-            "quant_rms":   math.sqrt(max(q_ms, 0.0)),
+            "seq":               self._seq,
+            "name":              name,
+            "component":         component.value if isinstance(component, Component) else str(component),
+            "rmse":              math.sqrt(max(mse, 0.0)),
+            "ref_rms":           math.sqrt(max(fp_ms, 0.0)),
+            "quant_rms":         math.sqrt(max(q_ms, 0.0)),
+            "cumulative_rmse":   cumulative_rmse,
+            "cumulative_ref_rms": cumulative_ref_rms,
         })
         self._seq += 1
 
@@ -267,10 +295,21 @@ class StatsTracker:
         ]
 
     def component_rows(self) -> List[dict]:
-        """Return per-component aggregate stats."""
+        """Return per-component aggregate stats, including cumulative RMSE."""
         by_component: Dict[Component, List[LayerStats]] = defaultdict(list)
         for s in self._layers.values():
             by_component[s.component].append(s)
+
+        # Aggregate cumulative RMSE from per-call records
+        cum_by_comp: Dict[str, list] = defaultdict(list)
+        cum_rel_by_comp: Dict[str, list] = defaultdict(list)
+        for c in self.calls:
+            cum = c.get("cumulative_rmse", float("nan"))
+            ref = c.get("cumulative_ref_rms", float("nan"))
+            if not math.isnan(cum):
+                cum_by_comp[c["component"]].append(cum)
+            if not math.isnan(cum) and not math.isnan(ref) and ref > 0:
+                cum_rel_by_comp[c["component"]].append(cum / ref)
 
         rows = []
         for comp in Component:
@@ -281,7 +320,13 @@ class StatsTracker:
             rel_rmse_values = [s.rel_rmse for s in layers if not math.isnan(s.rel_rmse)]
             if not rmse_values:
                 continue
-            rows.append(ComponentStats(
+            # find the single worst layer by rel_rmse
+            layers_with_rel = [(s.rel_rmse, s.name) for s in layers if not math.isnan(s.rel_rmse)]
+            if layers_with_rel:
+                max_rel_rmse, max_rel_rmse_layer = max(layers_with_rel, key=lambda t: t[0])
+            else:
+                max_rel_rmse, max_rel_rmse_layer = float("nan"), ""
+            d = ComponentStats(
                 component=comp,
                 n_layers=len(layers),
                 mean_rmse=_safe_mean(rmse_values),
@@ -289,8 +334,14 @@ class StatsTracker:
                 max_rmse=max(rmse_values),
                 min_rmse=min(rmse_values),
                 mean_rel_rmse=_safe_mean(rel_rmse_values),
+                std_rel_rmse=_safe_std(rel_rmse_values),
+                max_rel_rmse=max_rel_rmse,
+                max_rel_rmse_layer=max_rel_rmse_layer,
                 total_calls=sum(s.n_calls for s in layers),
-            ).to_dict())
+            ).to_dict()
+            d["mean_cumulative_rmse"]     = _safe_mean(cum_by_comp.get(comp.value, []))
+            d["mean_cumulative_rel_rmse"] = _safe_mean(cum_rel_by_comp.get(comp.value, []))
+            rows.append(d)
         return rows
 
     def summary(self) -> "StatsReport":

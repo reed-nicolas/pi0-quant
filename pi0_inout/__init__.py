@@ -35,7 +35,9 @@ from .model_patcher import (
     patch_model, unpatch_model, count_layers, list_linear_layers,
     QuantAttnContext,
     QuantGroup, ALL_GROUPS,
+    OpScope, ALL_SCOPES,
     patch_attn_sdpa, unpatch_attn_sdpa,
+    patch_attn_eager, unpatch_attn_eager,
 )
 from .quant_vector import (
     patch_vector_ops, unpatch_vector_ops,
@@ -82,6 +84,8 @@ __all__ = [
     "ALL_GROUPS",
     "patch_attn_sdpa",
     "unpatch_attn_sdpa",
+    "patch_attn_eager",
+    "unpatch_attn_eager",
     # Vector ops
     "patch_vector_ops",
     "unpatch_vector_ops",
