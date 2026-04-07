@@ -480,7 +480,8 @@ def main() -> None:
     baseline_actions = _collect_actions(policy, observations, args.steps, "baseline", t0)
     baseline_elapsed = time.monotonic() - t0
     print(f"Baseline done in {baseline_elapsed:.1f}s")
-    np.save(out_dir / "baseline_actions.npy", np.stack([a.numpy() for a in baseline_actions]))
+    _arr = np.stack([a.numpy() for a in baseline_actions])
+    (out_dir / "baseline_actions.txt").write_text(f"shape: {_arr.shape}\ndtype: {_arr.dtype}\n{_arr}\n")
 
     # ── Register ipt_numba_exp variants and sweep ─────────────────────────────
     sweep_rows: list[dict] = []
@@ -512,7 +513,8 @@ def main() -> None:
 
         elapsed_s = time.monotonic() - eb_t0
 
-        np.save(out_dir / f"quant_actions_eb{extra_bits}.npy", np.stack([a.numpy() for a in quant_actions]))
+        _arr = np.stack([a.numpy() for a in quant_actions])
+        (out_dir / f"quant_actions_eb{extra_bits}.txt").write_text(f"shape: {_arr.shape}\ndtype: {_arr.dtype}\n{_arr}\n")
 
         overall_rmse, overall_ref_rms = _write_action_rmse(
             out_dir / f"action_rmse_eb{extra_bits}.csv",

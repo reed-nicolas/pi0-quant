@@ -69,7 +69,6 @@ from pi0_inout import (
     get_functional_model_factory, list_functional_models,
     set_fp8_mode,
 )
-from pi0_inout.eval_harness import _compute_action_rmse
 from pi0_inout.serve_quant import _load_norm_stats, Pi0PyTorchPolicy
 
 PASSTHROUGH = "passthrough"
@@ -488,8 +487,9 @@ def main() -> None:
 
     (out_dir / "config.json").write_text(json.dumps(config_record, indent=2, default=str))
 
-    np.save(out_dir / "baseline_actions.npy", np.stack([a.numpy() for a in baseline_actions]))
-    np.save(out_dir / "quant_actions.npy",    np.stack([a.numpy() for a in quant_actions]))
+    for _name, _actions in [("baseline_actions", baseline_actions), ("quant_actions", quant_actions)]:
+        _arr = np.stack([a.numpy() for a in _actions])
+        (out_dir / f"{_name}.txt").write_text(f"shape: {_arr.shape}\ndtype: {_arr.dtype}\n{_arr}\n")
 
     overall_rmse, overall_ref_rms = _write_action_rmse(
         out_dir / "action_rmse.csv",
