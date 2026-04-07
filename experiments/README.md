@@ -96,7 +96,7 @@ Results are written to `experiments/results/run_output_eval/<timestamp>_<model>_
 - `action_rmse.csv` — per-observation RMSE, ref_rms, rel_rmse + overall row
 - `config.json` — exact parameters used
 - `command.txt` — full command that produced this run
-- `baseline_actions.npy` / `quant_actions.npy` — raw action arrays for direct comparison
+- `baseline_actions.txt` / `quant_actions.txt` — raw action arrays for direct comparison
 
 A row is appended to `results/run_output_eval/all_runs_output_summary.csv` after each run.
 
@@ -148,7 +148,7 @@ Results are written to `experiments/results/sweep_extra_bits/<timestamp>_ipt_num
 - `action_rmse_eb<N>.csv` — per-observation RMSE for each extra_bits value
 - `sweep_summary.csv` — one row per extra_bits value with overall RMSE
 - `command.txt` — full command that produced this run
-- `baseline_actions.npy` / `quant_actions_eb<N>.npy` — raw action arrays
+- `baseline_actions.txt` / `quant_actions_eb<N>.txt` — raw action arrays
 
 A row per extra_bits value is appended to `results/sweep_extra_bits/all_runs_output_summary.csv`.
 
