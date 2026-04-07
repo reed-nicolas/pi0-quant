@@ -83,3 +83,103 @@ python -m pi0_inout.run_rel_sweep_two_servers \
     --start-rel-err 1e-4 --rel-err-step 1e-4 --max-rel-err 0.1 \
     --quantized-server-cmd 'env CUDA_VISIBLE_DEVICES=2 python pi0_inout/serve_quant.py --openpi-dir /path/to/openpi --checkpoint-dir /path/to/checkpoint --config pi0_droid --gpu 0 --input-fmt float8_e5m2 --output-fmt bfloat16'
 ```
+
+---
+
+## Action output RMSE evaluation (`run_output_eval.py`)
+
+`run_output_eval.py` runs the model twice on the same seeded observations — once
+unpatched (baseline bf16) and once with a chosen functional model or format-flag
+quantization — and reports per-observation and overall action-output RMSE.
+
+Results are written to `experiments/results/run_output_eval/<timestamp>_<model>_steps<N>/`:
+- `action_rmse.csv` — per-observation RMSE, ref_rms, rel_rmse + overall row
+- `config.json` — exact parameters used
+- `command.txt` — full command that produced this run
+- `baseline_actions.npy` / `quant_actions.npy` — raw action arrays for direct comparison
+
+A row is appended to `results/run_output_eval/all_runs_output_summary.csv` after each run.
+
+### Usage
+
+```bash
+OPENPI_DIR=/nscratch/juhyundo/pi0-quant/openpi/ \
+CUDA_VISIBLE_DEVICES=1 \
+uv run experiments/run_output_eval.py \
+    --label verify_ipt_numba \
+    --checkpoint-dir /nscratch/juhyundo/pi0-quant/datasets/openpi/openpi-assets/checkpoints/pi0_droid_jointpos_safetensors \
+    --config pi0_droid_jointpos_polaris \
+    --norm-stats-dir /nscratch/juhyundo/pi0-quant/datasets/openpi/openpi-assets/checkpoints/polaris/pi0_droid_jointpos_polaris/assets/droid \
+    --functional-model ipt_numba \
+    --gpu 0 --n-obs 1 --steps 5 --seed 0
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--label` | *(required)* | Run label, used in output summary CSV |
+| `--checkpoint-dir` | *(required)* | Path to model checkpoint directory |
+| `--config` | `pi05_droid_jointpos_polaris` | openpi training config name |
+| `--norm-stats-dir` | — | Directory containing `norm_stats.json` for action unnormalization |
+| `--gpu` | `0` | CUDA device index (use with `CUDA_VISIBLE_DEVICES`) |
+| `--functional-model` | — | Hardware-accurate matmul sim (e.g. `ipt_numba`); mutually exclusive with `--mx-input-fmt` |
+| `--mx-input-fmt` | passthrough | Format-flag quantization for matmul inputs |
+| `--mx-output-fmt` | passthrough | Format for matmul outputs |
+| `--vec-input-fmt` | passthrough | Format for vector op inputs |
+| `--vec-output-fmt` | passthrough | Format for vector op outputs |
+| `--active-groups` | all | Comma-separated components: `vision,language,action_expert,action_head` |
+| `--n-obs` | `4` | Number of random observations |
+| `--steps` | `10` | Diffusion steps (label only — model uses 10 internally) |
+| `--seed` | `0` | Seeds numpy RNG (observations) and torch RNG (diffusion noise) |
+| `--results-dir` | `experiments/results` | Root directory for outputs |
+
+---
+
+## Extra-bits accumulator sweep (`sweep_extra_bits.py`)
+
+`sweep_extra_bits.py` sweeps the `extra_bits` parameter of `ipt_numba_exp`
+(accumulator width = 15 + extra_bits) and measures action-output RMSE vs a
+single shared baseline at each value. All sweep points use identical seeded
+observations and diffusion noise for a fair comparison.
+`extra_bits=17` → `int_width=32`, identical to `ipt_numba`.
+
+Results are written to `experiments/results/sweep_extra_bits/<timestamp>_ipt_numba_exp_steps<N>/`:
+- `action_rmse_eb<N>.csv` — per-observation RMSE for each extra_bits value
+- `sweep_summary.csv` — one row per extra_bits value with overall RMSE
+- `command.txt` — full command that produced this run
+- `baseline_actions.npy` / `quant_actions_eb<N>.npy` — raw action arrays
+
+A row per extra_bits value is appended to `results/sweep_extra_bits/all_runs_output_summary.csv`.
+
+### Usage
+
+```bash
+OPENPI_DIR=/nscratch/juhyundo/pi0-quant/openpi/ \
+CUDA_VISIBLE_DEVICES=1 \
+uv run experiments/sweep_extra_bits.py \
+    --label sweep_run \
+    --checkpoint-dir /nscratch/juhyundo/pi0-quant/datasets/openpi/openpi-assets/checkpoints/pi0_droid_jointpos_safetensors \
+    --config pi0_droid_jointpos_polaris \
+    --norm-stats-dir /nscratch/juhyundo/pi0-quant/datasets/openpi/openpi-assets/checkpoints/polaris/pi0_droid_jointpos_polaris/assets/droid \
+    --gpu 0 --n-obs 1 --steps 5 \
+    --extra-bits-min 0 --extra-bits-max 17 --extra-bits-step 1 --seed 0
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--label` | *(required)* | Run label, used in output summary CSV |
+| `--checkpoint-dir` | *(required)* | Path to model checkpoint directory |
+| `--config` | `pi05_droid_jointpos_polaris` | openpi training config name |
+| `--norm-stats-dir` | — | Directory containing `norm_stats.json` for action unnormalization |
+| `--gpu` | `0` | CUDA device index (use with `CUDA_VISIBLE_DEVICES`) |
+| `--extra-bits-min` | `0` | Start of extra_bits sweep (inclusive) |
+| `--extra-bits-max` | `17` | End of extra_bits sweep (inclusive); 17 = same as `ipt_numba` |
+| `--extra-bits-step` | `1` | Step size for sweep |
+| `--n-obs` | `1` | Number of random observations |
+| `--steps` | `10` | Diffusion steps (label only — model uses 10 internally) |
+| `--seed` | `0` | Seeds numpy RNG (observations) and torch RNG (diffusion noise) |
+| `--active-groups` | all | Comma-separated components to quantize |
+| `--results-dir` | `experiments/results` | Root directory for outputs |
