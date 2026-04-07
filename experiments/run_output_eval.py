@@ -488,6 +488,9 @@ def main() -> None:
 
     (out_dir / "config.json").write_text(json.dumps(config_record, indent=2, default=str))
 
+    np.save(out_dir / "baseline_actions.npy", np.stack([a.numpy() for a in baseline_actions]))
+    np.save(out_dir / "quant_actions.npy",    np.stack([a.numpy() for a in quant_actions]))
+
     overall_rmse, overall_ref_rms = _write_action_rmse(
         out_dir / "action_rmse.csv",
         baseline_actions,

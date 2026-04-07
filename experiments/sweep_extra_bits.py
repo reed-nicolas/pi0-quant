@@ -476,9 +476,11 @@ def main() -> None:
     print(f"\n{'='*60}")
     print("=== Baseline (unpatched) pass — runs once for all extra_bits ===")
     t0 = time.monotonic()
+    torch.manual_seed(args.seed)
     baseline_actions = _collect_actions(policy, observations, args.steps, "baseline", t0)
     baseline_elapsed = time.monotonic() - t0
     print(f"Baseline done in {baseline_elapsed:.1f}s")
+    np.save(out_dir / "baseline_actions.npy", np.stack([a.numpy() for a in baseline_actions]))
 
     # ── Register ipt_numba_exp variants and sweep ─────────────────────────────
     sweep_rows: list[dict] = []
@@ -493,6 +495,7 @@ def main() -> None:
         print(f"\n{'='*60}")
         print(f"=== extra_bits={extra_bits} ({extra_bits_values.index(extra_bits)+1}/{len(extra_bits_values)}) ===")
         eb_t0 = time.monotonic()
+        torch.manual_seed(args.seed)
 
         quant_actions = _run_quantized_pass(
             policy=policy,
@@ -508,6 +511,8 @@ def main() -> None:
         )
 
         elapsed_s = time.monotonic() - eb_t0
+
+        np.save(out_dir / f"quant_actions_eb{extra_bits}.npy", np.stack([a.numpy() for a in quant_actions]))
 
         overall_rmse, overall_ref_rms = _write_action_rmse(
             out_dir / f"action_rmse_eb{extra_bits}.csv",
