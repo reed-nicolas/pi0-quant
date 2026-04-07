@@ -31,9 +31,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import importlib.machinery
-import importlib.util
-
 import numpy as np
 import torch
 
@@ -55,53 +52,7 @@ from pi0_inout import (
 from pi0_inout.serve_quant import _load_norm_stats, Pi0PyTorchPolicy
 
 
-# ---------------------------------------------------------------------------
-# Load ipt_numba_exp from pyc-only package (no .py source files present)
-# ---------------------------------------------------------------------------
-
-def _load_pyc_package(pkg_name: str, pkg_dir: Path) -> None:
-    """Register a pyc-only package and its submodules into sys.modules."""
-    cache = pkg_dir / "__pycache__"
-    tag = f"cpython-{sys.version_info.major}{sys.version_info.minor}"
-
-    def _load(full_name: str, pyc: Path, is_pkg: bool = False) -> None:
-        loader = importlib.machinery.SourcelessFileLoader(full_name, str(pyc))
-        spec = importlib.util.spec_from_file_location(
-            full_name, pyc, loader=loader,
-            submodule_search_locations=([str(pkg_dir)] if is_pkg else None),
-        )
-        mod = importlib.util.module_from_spec(spec)
-        mod.__package__ = pkg_name
-        sys.modules[full_name] = mod
-        spec.loader.exec_module(mod)
-
-    _load(pkg_name, cache / f"__init__.{tag}.pyc", is_pkg=True)
-    for submod in ("fp_formats", "params_and_requests", "converters", "_numba_kernels", "ipt_rtl_linear"):
-        pyc = cache / f"{submod}.{tag}.pyc"
-        if pyc.exists():
-            _load(f"{pkg_name}.{submod}", pyc)
-
-
-# Numba's cache locator requires the source .py file to exist; since ipt_numba_exp
-# is pyc-only, patch enable_caching to silently skip caching setup.  The kernel
-# will be JIT-compiled fresh at first call rather than loaded from .nbc cache.
-import numba.core.dispatcher as _ncd
-_orig_enable_caching = _ncd.Dispatcher.enable_caching
-def _patched_enable_caching(self):
-    try:
-        _orig_enable_caching(self)
-    except RuntimeError:
-        pass
-_ncd.Dispatcher.enable_caching = _patched_enable_caching
-
-_load_pyc_package(
-    "funct_models_ipt.ipt_numba_exp",
-    _REPO / "funct_models_ipt" / "ipt_numba_exp",
-)
-
-_ncd.Dispatcher.enable_caching = _orig_enable_caching  # restore
-
-from funct_models_ipt.ipt_numba_exp.ipt_rtl_linear import IPTLinearRTLFunction as IPTNumbaExpLinear  # noqa: E402
+from funct_models_ipt.ipt_numba_exp.ipt_rtl_linear import IPTLinearRTLFunction as IPTNumbaExpLinear
 
 PASSTHROUGH = "passthrough"
 
