@@ -163,6 +163,7 @@ def run(
     functional_model_name: Optional[str],
     num_steps: int,
     t0: float,
+    seed: int = 0,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """
     Collect baseline actions (unpatched) then quantized actions (patched).
@@ -172,6 +173,7 @@ def run(
 
     # --- Baseline pass -------------------------------------------------------
     print("\n=== Baseline (unpatched) pass ===")
+    torch.manual_seed(seed)
     baseline_actions = _collect_actions(policy, observations, num_steps, "baseline", t0)
 
     # --- Resolve effective formats -------------------------------------------
@@ -211,6 +213,7 @@ def run(
 
     # --- Quantized pass ------------------------------------------------------
     print("\n=== Quantized pass ===")
+    torch.manual_seed(seed)
     quant_actions: list[torch.Tensor] = []
     n = len(observations)
     stop = threading.Event()
@@ -473,6 +476,7 @@ def main() -> None:
         functional_model_name=args.functional_model,
         num_steps=args.steps,
         t0=t0,
+        seed=args.seed,
     )
     elapsed_s = time.monotonic() - t0
     config_record["elapsed_seconds"] = round(elapsed_s, 2)
