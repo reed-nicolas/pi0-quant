@@ -13,12 +13,18 @@ Unpatched pass (via forward hooks registered in run_eval.py):
     unpatched_y       [N, *]  F.linear(x, w, b) output
 
 Patched pass (via QuantLinear.forward):
-    patched_x_q       [N, *]  quantized activation (quantized from unpatched_x; absent for functional model)
-    patched_w_q       [out, in]  quantized weight (stored once; absent for functional model)
-    patched_b_q       [out]  quantized bias (stored once; absent if no bias or functional model)
-    patched_y_quant   [N, *]  functional model / format-flag output
+    patched_x_fp8        [N, *]  raw FP8 E4M3 bytes of input (uint8)
+    patched_x_fp8_scale  scalar  per-tensor scale for x (float32)
+    patched_w_fp8        [out, in]  raw FP8 E4M3 bytes of weight (uint8; stored once)
+    patched_w_fp8_scale  scalar  per-tensor scale for w (float32; stored once)
+    patched_b_fp8        [out]  raw FP8 E4M3 bytes of bias (uint8; stored once; absent if no bias)
+    patched_b_fp8_scale  scalar  per-tensor scale for b (float32; stored once; absent if no bias)
+    patched_y_quant      [N, *]  functional model / format-flag output (int16 BF16 bits)
 
-All arrays stored as float32 in the .npz (numpy does not support bfloat16).
+BF16 arrays stored as int16 raw bits (numpy lacks native bf16).
+  Reconstruct: torch.from_numpy(arr).view(torch.bfloat16)
+FP8 arrays stored as uint8 raw bits.
+  Reconstruct: torch.from_numpy(arr).view(torch.float8_e4m3fn) * scale
 
 File naming
 -----------
@@ -42,13 +48,23 @@ import torch
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _to_f32_numpy(t: torch.Tensor) -> np.ndarray:
-    """CPU transfer + float32 cast + numpy conversion."""
-    return t.detach().to(torch.float32).cpu().numpy()
+def _to_bf16_numpy(t: torch.Tensor) -> np.ndarray:
+    """CPU transfer in bf16, stored as int16 raw bits (numpy lacks native bf16).
+    Reload with: torch.from_numpy(arr).view(torch.bfloat16)"""
+    return t.detach().to(torch.bfloat16).view(torch.int16).cpu().numpy()
 
 
-def _maybe_f32_numpy(t: Optional[torch.Tensor]) -> Optional[np.ndarray]:
-    return None if t is None else _to_f32_numpy(t)
+def _maybe_bf16_numpy(t: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+    return None if t is None else _to_bf16_numpy(t)
+
+
+def _to_uint8_numpy(t: torch.Tensor) -> np.ndarray:
+    """Store raw FP8 bit patterns as uint8 (one byte per element)."""
+    return t.detach().view(torch.uint8).cpu().numpy()
+
+# in case bias is none
+def _maybe_uint8_numpy(t: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+    return None if t is None else _to_uint8_numpy(t)
 
 
 def _stack_calls(
@@ -130,27 +146,33 @@ class MatmulIOStore:
     ) -> None:
         """Called from the forward hook on nn.Linear during the reference pass."""
         self._unpatched[name].append({
-            "x": _to_f32_numpy(x),
-            "w": _to_f32_numpy(w),
-            "b": _maybe_f32_numpy(b),
-            "y": _to_f32_numpy(y),
+            "x": _to_bf16_numpy(x),
+            "w": _to_bf16_numpy(w),
+            "b": _maybe_bf16_numpy(b),
+            "y": _to_bf16_numpy(y),
         })
 
     @torch._dynamo.disable
     def record_patched(
         self,
         name: str,
-        x_q: Optional[torch.Tensor],
-        w_q: Optional[torch.Tensor],
-        b_q: Optional[torch.Tensor],
+        x_fp8: torch.Tensor,
+        x_fp8_scale: float,
+        w_fp8: torch.Tensor,
+        w_fp8_scale: float,
+        b_fp8: Optional[torch.Tensor],
+        b_fp8_scale: Optional[float],
         y_quant: torch.Tensor,
     ) -> None:
         """Called from QuantLinear.forward() during the patched pass."""
         self._patched[name].append({
-            "x_q":     _maybe_f32_numpy(x_q),
-            "w_q":     _maybe_f32_numpy(w_q),
-            "b_q":     _maybe_f32_numpy(b_q),
-            "y_quant": _to_f32_numpy(y_quant),
+            "x_fp8":       _to_uint8_numpy(x_fp8),
+            "x_fp8_scale": np.float32(x_fp8_scale),
+            "w_fp8":       _to_uint8_numpy(w_fp8),
+            "w_fp8_scale": np.float32(w_fp8_scale),
+            "b_fp8":       _maybe_uint8_numpy(b_fp8),
+            "b_fp8_scale": np.float32(b_fp8_scale) if b_fp8_scale is not None else None,
+            "y_quant":     _to_bf16_numpy(y_quant),
         })
 
     # ------------------------------------------------------------------
@@ -159,7 +181,9 @@ class MatmulIOStore:
 
     def save(self) -> None:
         """Write one .npz per layer. Call after all inference is complete."""
-        all_names = sorted(set(self._unpatched) | set(self._patched))
+        # Only save layers that were patched — _patched is populated only for
+        # active-groups layers, so this respects --active-groups filtering.
+        all_names = sorted(set(self._patched))
         if not all_names:
             print("[MatmulIOStore] No tensors recorded — nothing to save.")
             return
@@ -177,7 +201,8 @@ class MatmulIOStore:
                 )
             if pat_calls:
                 arrays.update(
-                    _stack_calls(pat_calls, prefix="patched", static_keys={"w_q", "b_q"})
+                    _stack_calls(pat_calls, prefix="patched",
+                                 static_keys={"w_fp8", "w_fp8_scale", "b_fp8", "b_fp8_scale"})
                 )
 
             fname = name.replace(".", "__") + ".npz"

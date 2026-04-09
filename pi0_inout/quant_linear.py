@@ -34,7 +34,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 from ._dispatch_guards import _in_quant_guard
-from .quant_types import QuantFormat, quant
+from .quant_types import QuantFormat, quant, quant_fp8_raw
 from .stats_tracker import StatsTracker, Component
 from .rel_noise import inject_rel_noise
 from .matmul_io_store import MatmulIOStore
@@ -164,13 +164,29 @@ class QuantLinear(nn.Module):
                 _in_quant_guard.active = False
 
         # ── Matmul I/O tensor capture ─────────────────────────────────────────
+        # Always capture raw FP8 E4M3 bytes + scale for storage, regardless of
+        # mx_input_fmt or functional_model.  Guard with _in_quant_guard: amax()
+        # inside quant_fp8_raw() is in TARGET_OPS and would be re-intercepted by
+        # VectorQuantMode otherwise.
         if self.matmul_io_store is not None:
-            with torch.no_grad():
-                self.matmul_io_store.record_patched(
-                    name=self.layer_name,
-                    x_q=x_q, w_q=w_q, b_q=b_q,
-                    y_quant=y_out,
-                )
+            _in_quant_guard.active = True
+            try:
+                with torch.no_grad():
+                    x_fp8, x_scale = quant_fp8_raw(x.float())
+                    w_fp8, w_scale = quant_fp8_raw(w.float())
+                    if b is not None:
+                        b_fp8, b_scale = quant_fp8_raw(b.float())
+                    else:
+                        b_fp8, b_scale = None, None
+                    self.matmul_io_store.record_patched(
+                        name=self.layer_name,
+                        x_fp8=x_fp8, x_fp8_scale=x_scale,
+                        w_fp8=w_fp8, w_fp8_scale=w_scale,
+                        b_fp8=b_fp8, b_fp8_scale=b_scale,
+                        y_quant=y_out,
+                    )
+            finally:
+                _in_quant_guard.active = False
 
         return y_out
 

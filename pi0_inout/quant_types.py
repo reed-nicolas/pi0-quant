@@ -190,6 +190,45 @@ def _quant_fp8_scaled(x: torch.Tensor, fmt: QuantFormat) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Raw FP8 capture (for golden-data storage)
+# ---------------------------------------------------------------------------
+
+def quant_fp8_raw(
+    x: torch.Tensor,
+    fmt: QuantFormat = QuantFormat.FLOAT8_E4M3,
+) -> tuple[torch.Tensor, float]:
+    """
+    Quantize x to FP8 and return (raw_bytes, scale).
+
+    raw_bytes : uint8 tensor, same shape as x, containing raw FP8 bit patterns.
+                View as torch.float8_e4m3fn (or e5m2) to interpret as FP8 values.
+    scale     : float scalar.  Multiply (raw_bytes viewed as fp8) by scale to
+                recover the quantized values in original units:
+                    x_approx = raw_bytes.view(fp8_dtype) * scale
+
+    Uses the current fp8_mode (set via set_fp8_mode): "po2" or "scaled".
+    """
+    target = TORCH_DTYPE[fmt]
+    fp8_max = _FP8_MAX[fmt]
+
+    x_f32 = x.float()
+    amax = x_f32.abs().max().item()
+    if amax == 0:
+        raw = torch.zeros_like(x_f32).to(target).view(torch.uint8)
+        return raw, 1.0
+
+    if _fp8_mode == "po2":
+        fp8_max_po2 = _FP8_MAX_PO2[fmt]
+        scale = 2.0 ** math.floor(math.log2(amax / fp8_max_po2))
+    else:
+        scale = amax / fp8_max
+
+    x_scaled = (x_f32 / scale).clamp(-fp8_max, fp8_max)
+    raw = x_scaled.to(target).view(torch.uint8)
+    return raw, float(scale)
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
