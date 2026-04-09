@@ -72,6 +72,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
+import numpy as np
+import sentencepiece
 import torch
 import torch.nn as nn
 
@@ -129,6 +131,129 @@ def _make_dummy_obs(config_ns: SimpleNamespace, device: torch.device) -> SimpleN
         token_ar_mask=         torch.zeros(1, max_tok, dtype=torch.bool,  device=device),
         token_loss_mask=       torch.zeros(1, max_tok, dtype=torch.bool,  device=device),
     )
+
+
+def _load_real_obs(
+    obs_dir: str,
+    config_ns: SimpleNamespace,
+    checkpoint_dir: str,
+    device: torch.device,
+    obs_file: str | None = None,
+    norm_stats_dir: str | None = None,
+) -> list[SimpleNamespace]:
+    from pi0_inout.serve_quant import _load_norm_stats
+
+    obs_dir = Path(obs_dir)
+    if obs_file is not None:
+        npz_path = Path(obs_file)
+        if not npz_path.is_absolute():
+            npz_path = obs_dir / npz_path
+        if not npz_path.exists():
+            raise FileNotFoundError(f"obs file not found: {npz_path}")
+        npz_files = [npz_path]
+    else:
+        npz_files = sorted(obs_dir.glob("obs_*.npz"))
+    if not npz_files:
+        raise FileNotFoundError(f"No obs_*.npz files found in {obs_dir}")
+
+    # Load norm stats
+    norm_stats = None
+    _norm_dir = norm_stats_dir if norm_stats_dir is not None else checkpoint_dir
+    try:
+        norm_stats = _load_norm_stats(_norm_dir)
+    except FileNotFoundError:
+        print(f"[warn] norm_stats.json not found in {_norm_dir}; skipping normalization")
+
+    # Load tokenizer (same search path as Pi0PyTorchPolicy)
+    tokenizer_path = None
+    for candidate in [
+        Path.home() / "Desktop" / "paligemma_tokenizer.model",
+        Path.home() / ".cache" / "openpi" / "big_vision" / "paligemma_tokenizer.model",
+    ]:
+        if candidate.exists():
+            tokenizer_path = str(candidate)
+            break
+    if tokenizer_path is None:
+        raise FileNotFoundError(
+            "Cannot find paligemma_tokenizer.model. "
+            "Place it at ~/.cache/openpi/big_vision/paligemma_tokenizer.model"
+        )
+    tokenizer = sentencepiece.SentencePieceProcessor(model_proto=open(tokenizer_path, "rb").read())
+
+    max_tok = config_ns.max_token_len
+    observations = []
+
+    for npz_path in npz_files:
+        data = np.load(npz_path, allow_pickle=False)
+
+        # Images: uint8 HWC (H,W,3) → float32 CHW (1,3,224,224) in [-1, 1]
+        # Pre-resize to 224x224 here (matching the sim-evals WebSocket path which resizes
+        # before sending) to avoid a batch-squeeze bug in resize_with_pad_torch.
+        def _img(arr):
+            t = torch.from_numpy(arr.copy()).to(device)
+            t = t.permute(2, 0, 1).unsqueeze(0).float()  # [1, 3, H, W]
+            t = t / 255.0 * 2.0 - 1.0
+            if t.shape[2:] != (224, 224):
+                t = torch.nn.functional.interpolate(
+                    t, size=(224, 224), mode="bilinear", align_corners=False
+                )
+            return t
+
+        base_img  = _img(data["right_image"])
+        wrist_img = _img(data["wrist_image"])
+        zero_img  = torch.zeros(1, 3, 224, 224, dtype=torch.float32, device=device)
+
+        # State: concat joint + gripper, normalize, pad to 32
+        joint = data["joint_position"].astype(np.float32).flatten()
+        grip  = data["gripper_position"].astype(np.float32).flatten()
+        raw_state = np.concatenate([joint, grip])
+        if norm_stats is not None and "state" in norm_stats:
+            s = norm_stats["state"]
+            mean = s.mean[:raw_state.shape[0]].astype(np.float32)
+            std  = s.std[:raw_state.shape[0]].astype(np.float32)
+            norm_state = (raw_state - mean) / (std + 1e-6)
+        else:
+            norm_state = raw_state
+        state_padded = np.zeros(32, dtype=np.float32)
+        state_padded[:norm_state.shape[0]] = norm_state
+        state = torch.from_numpy(state_padded).unsqueeze(0).to(device)
+
+        # Prompt: tokenize
+        prompt_text = data["prompt"].item()
+        if isinstance(prompt_text, bytes):
+            prompt_text = prompt_text.decode("utf-8")
+        prompt_text = prompt_text.strip().replace("_", " ").replace("\n", " ")
+        if prompt_text:
+            tokens = tokenizer.encode(prompt_text, add_bos=True) + tokenizer.encode("\n")
+        else:
+            tokens = []
+        tok_len = min(len(tokens), max_tok)
+        tokens = tokens[:tok_len]
+        pad_len = max_tok - tok_len
+        tokens_padded = tokens + [0] * pad_len
+        mask_list = [True] * tok_len + [False] * pad_len
+
+        observations.append(SimpleNamespace(
+            _source=str(npz_path),
+            images={
+                "base_0_rgb":        base_img,
+                "left_wrist_0_rgb":  wrist_img,
+                "right_wrist_0_rgb": zero_img,
+            },
+            image_masks={
+                "base_0_rgb":        torch.ones(1,  dtype=torch.bool, device=device),
+                "left_wrist_0_rgb":  torch.ones(1,  dtype=torch.bool, device=device),
+                "right_wrist_0_rgb": torch.zeros(1, dtype=torch.bool, device=device),
+            },
+            state=state,
+            tokenized_prompt=      torch.tensor([tokens_padded], dtype=torch.int64, device=device),
+            tokenized_prompt_mask= torch.tensor([mask_list],      dtype=torch.bool,  device=device),
+            token_ar_mask=         torch.zeros(1, max_tok, dtype=torch.bool, device=device),
+            token_loss_mask=       torch.zeros(1, max_tok, dtype=torch.bool, device=device),
+        ))
+
+    print(f"Loaded {len(observations)} real observations from {obs_dir}")
+    return observations
 
 
 def _rel_rmse(rmse: float, ref_rms: float) -> float:
@@ -522,7 +647,8 @@ def run(
 
     with torch.no_grad(), vec_ctx:
         for i, obs in enumerate(observations):
-            print(f"\n[obs {i + 1}/{n_obs}] running ({num_steps} diffusion steps)...", flush=True)
+            src = getattr(obs, "_source", "dummy")
+            print(f"\n[obs {i + 1}/{n_obs}] source={src}  running ({num_steps} diffusion steps)...", flush=True)
             obs_t0 = time.monotonic()
             torch.manual_seed(i)
             ref_store.reset_counters()
@@ -571,7 +697,17 @@ def main() -> None:
 
     # Eval settings
     parser.add_argument("--n-obs",  type=int, default=4,
-                        help="Number of random observations to run")
+                        help="Number of random observations to run (ignored when --obs-dir is set)")
+    parser.add_argument("--obs-dir", metavar="DIR", default=None,
+                        help="Directory of obs_*.npz files saved from sim-evals. "
+                             "When set, uses real observations instead of random dummies.")
+    parser.add_argument("--obs-file", metavar="FILE", default=None,
+                        help="Single obs_*.npz file to load (bare filename or full path). "
+                             "Requires --obs-dir for norm_stats lookup. "
+                             "When set, overrides globbing all files in --obs-dir.")
+    parser.add_argument("--norm-stats-dir", metavar="DIR", default=None,
+                        help="Directory containing norm_stats.json. "
+                             "Defaults to --checkpoint-dir if not set.")
     parser.add_argument("--steps",  type=int, default=10,
                         help="Diffusion steps per sample_actions call")
 
@@ -656,15 +792,24 @@ def main() -> None:
     model.eval()
 
     torch.manual_seed(0)
-    observations = [_make_dummy_obs(config_ns, device) for _ in range(args.n_obs)]
-    print(f"Observations: {args.n_obs}  steps: {args.steps}")
+    if args.obs_dir is not None:
+        observations = _load_real_obs(args.obs_dir, config_ns, args.checkpoint_dir, device,
+                                      obs_file=args.obs_file,
+                                      norm_stats_dir=args.norm_stats_dir)
+        src = args.obs_file if args.obs_file else f"all obs_*.npz in {args.obs_dir}"
+        print(f"[obs] real observations from: {src}")
+    else:
+        observations = [_make_dummy_obs(config_ns, device) for _ in range(args.n_obs)]
+        print(f"[obs] using {len(observations)} dummy (random) observations")
+    print(f"Observations: {len(observations)}  steps: {args.steps}")
 
     # ── Build config record ──────────────────────────────────────────────────
     config_record = {
         "label":               args.label,
         "checkpoint_dir":      args.checkpoint_dir,
         "model_config":        args.config,
-        "n_obs":               args.n_obs,
+        "n_obs":               len(observations),
+        "obs_dir":             args.obs_dir,
         "steps":               args.steps,
         "gpu":                 args.gpu,
         "fp8_mode":            args.fp8_mode,
