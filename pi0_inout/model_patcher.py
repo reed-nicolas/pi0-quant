@@ -182,6 +182,7 @@ def patch_model(
     op_scopes: Optional[set["OpScope"]] = None,
     reference_store=None,
     matmul_io_store=None,
+    ref_input_store=None,
     verbose: bool = False,
 ) -> nn.Module:
     """
@@ -259,6 +260,7 @@ def patch_model(
             functional_model=fm,
             reference_store=reference_store,
             matmul_io_store=matmul_io_store,
+            ref_input_store=ref_input_store,
         )
 
         # Pre-register with tracker so summary() works even if some layers

@@ -13,11 +13,10 @@ Unpatched pass (via forward hooks registered in run_eval.py):
     unpatched_y       [N, *]  F.linear(x, w, b) output
 
 Patched pass (via QuantLinear.forward):
-    patched_x         [N, *]  activation in patched forward (may be corrupted by earlier layers)
-    patched_x_q       [N, *]  quantized activation (format-flag path only; absent for functional model)
-    patched_w_q       [out, in]  quantized weight (format-flag; stored once)
-    patched_b_q       [out]  quantized bias (format-flag; absent if no bias or functional model)
-    patched_y_quant   [N, *]  quantized output
+    patched_x_q       [N, *]  quantized activation (quantized from unpatched_x; absent for functional model)
+    patched_w_q       [out, in]  quantized weight (stored once; absent for functional model)
+    patched_b_q       [out]  quantized bias (stored once; absent if no bias or functional model)
+    patched_y_quant   [N, *]  functional model / format-flag output
 
 All arrays stored as float32 in the .npz (numpy does not support bfloat16).
 
@@ -141,9 +140,6 @@ class MatmulIOStore:
     def record_patched(
         self,
         name: str,
-        x: torch.Tensor,
-        w: torch.Tensor,
-        b: Optional[torch.Tensor],
         x_q: Optional[torch.Tensor],
         w_q: Optional[torch.Tensor],
         b_q: Optional[torch.Tensor],
@@ -151,9 +147,6 @@ class MatmulIOStore:
     ) -> None:
         """Called from QuantLinear.forward() during the patched pass."""
         self._patched[name].append({
-            "x":       _to_f32_numpy(x),
-            "w":       _to_f32_numpy(w),
-            "b":       _maybe_f32_numpy(b),
             "x_q":     _maybe_f32_numpy(x_q),
             "w_q":     _maybe_f32_numpy(w_q),
             "b_q":     _maybe_f32_numpy(b_q),
@@ -184,7 +177,7 @@ class MatmulIOStore:
                 )
             if pat_calls:
                 arrays.update(
-                    _stack_calls(pat_calls, prefix="patched", static_keys={"w", "b", "w_q", "b_q"})
+                    _stack_calls(pat_calls, prefix="patched", static_keys={"w_q", "b_q"})
                 )
 
             fname = name.replace(".", "__") + ".npz"

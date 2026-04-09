@@ -405,10 +405,11 @@ def run(
     }
     ref_hooks = ref_store.register_hooks(model, layer_names)
 
-    # ── Capture unpatched matmul I/O tensors during reference pass ────────────
+    # ── Capture unpatched matmul I/O tensors and clean inputs during reference pass ──
+    ref_input_store = ReferenceStore()
     io_hooks: list = []
     if matmul_io_store is not None:
-        def _make_io_hook(store: MatmulIOStore, name: str):
+        def _make_io_hook(store: MatmulIOStore, ri_store: ReferenceStore, name: str):
             def _hook(module, inp, out):
                 store.record_unpatched(
                     name=name,
@@ -417,12 +418,13 @@ def run(
                     b=module.bias,
                     y=out,
                 )
+                ri_store.capture(name, inp[0])
             return _hook
 
         for name, module in model.named_modules():
             if type(module) is nn.Linear and name in layer_names:
                 io_hooks.append(
-                    module.register_forward_hook(_make_io_hook(matmul_io_store, name))
+                    module.register_forward_hook(_make_io_hook(matmul_io_store, ref_input_store, name))
                 )
 
     # Also capture eager_attention_forward and SDPA outputs when attention is active.
@@ -473,6 +475,7 @@ def run(
         op_scopes=op_scopes,
         reference_store=ref_store,
         matmul_io_store=matmul_io_store,
+        ref_input_store=ref_input_store if matmul_io_store is not None else None,
     )
     if OpScope.CONV2D in op_scopes:
         patch_conv2d(
@@ -522,6 +525,8 @@ def run(
             print(f"\n[obs {i + 1}/{n_obs}] running ({num_steps} diffusion steps)...", flush=True)
             obs_t0 = time.monotonic()
             torch.manual_seed(i)
+            ref_store.reset_counters()
+            ref_input_store.reset_counters()
             model.sample_actions(str(device), obs, num_steps=num_steps)
             obs_elapsed = time.monotonic() - obs_t0
             print(f"[obs {i + 1}/{n_obs}] done in {obs_elapsed:.1f}s", flush=True)

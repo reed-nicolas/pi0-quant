@@ -69,6 +69,7 @@ class QuantLinear(nn.Module):
         functional_model=None,
         reference_store=None,
         matmul_io_store: Optional[MatmulIOStore] = None,
+        ref_input_store=None,
     ) -> None:
         super().__init__()
 
@@ -97,6 +98,7 @@ class QuantLinear(nn.Module):
         self.out_features    = linear.out_features
         self.reference_store = reference_store
         self.matmul_io_store = matmul_io_store
+        self.ref_input_store = ref_input_store
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight
@@ -106,6 +108,12 @@ class QuantLinear(nn.Module):
         # matches what the reference F.linear does and ensures passthrough gives 0 RMSE.
         dtype = w.dtype
         x = x.to(dtype)
+
+        # ── Substitute clean reference input (golden-data mode) ───────────────
+        if self.ref_input_store is not None:
+            x_clean = self.ref_input_store.get(self.layer_name)
+            if x_clean is not None:
+                x = x_clean.to(dtype=dtype, device=x.device)
 
         x_q = w_q = b_q = None  # only populated in format-flag path
 
@@ -160,7 +168,6 @@ class QuantLinear(nn.Module):
             with torch.no_grad():
                 self.matmul_io_store.record_patched(
                     name=self.layer_name,
-                    x=x, w=w, b=b,
                     x_q=x_q, w_q=w_q, b_q=b_q,
                     y_quant=y_out,
                 )
