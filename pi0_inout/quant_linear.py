@@ -37,6 +37,7 @@ from ._dispatch_guards import _in_quant_guard
 from .quant_types import QuantFormat, quant
 from .stats_tracker import StatsTracker, Component
 from .rel_noise import inject_rel_noise
+from .matmul_io_store import MatmulIOStore
 
 
 class QuantLinear(nn.Module):
@@ -67,6 +68,7 @@ class QuantLinear(nn.Module):
         noise_injection: float = 0.0,
         functional_model=None,
         reference_store=None,
+        matmul_io_store: Optional[MatmulIOStore] = None,
     ) -> None:
         super().__init__()
 
@@ -94,6 +96,7 @@ class QuantLinear(nn.Module):
         self.in_features     = linear.in_features
         self.out_features    = linear.out_features
         self.reference_store = reference_store
+        self.matmul_io_store = matmul_io_store
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight
@@ -103,6 +106,8 @@ class QuantLinear(nn.Module):
         # matches what the reference F.linear does and ensures passthrough gives 0 RMSE.
         dtype = w.dtype
         x = x.to(dtype)
+
+        x_q = w_q = b_q = None  # only populated in format-flag path
 
         if self.functional_model is not None:
             # Functional model handles quantization internally; pass tensors as-is.
@@ -125,6 +130,11 @@ class QuantLinear(nn.Module):
             # ── Quantize output, cast back to original dtype ──────────────────
             y_out = quant(y_accum.float(), self.mx_output_fmt).to(dtype)
 
+        # ── Fetch clean reference for tracker cumulative RMSE ────────────────
+        y_clean_ref = None
+        if self.tracker is not None and self.reference_store is not None:
+            y_clean_ref = self.reference_store.get(self.layer_name)
+
         # ── RMSE vs original model (native dtype, no fp32 upcast) ─────────────
         # Shield this block from VectorQuantMode interception: the arithmetic
         # inside tracker.record() (sub, pow, mean) must not be re-quantized.
@@ -135,8 +145,6 @@ class QuantLinear(nn.Module):
             try:
                 with torch.no_grad():
                     y_ref = F.linear(x, w, b)
-                    y_clean_ref = (self.reference_store.get(self.layer_name)
-                                   if self.reference_store is not None else None)
                     self.tracker.record(
                         name=self.layer_name,
                         component=self.component,
@@ -146,6 +154,16 @@ class QuantLinear(nn.Module):
                     )
             finally:
                 _in_quant_guard.active = False
+
+        # ── Matmul I/O tensor capture ─────────────────────────────────────────
+        if self.matmul_io_store is not None:
+            with torch.no_grad():
+                self.matmul_io_store.record_patched(
+                    name=self.layer_name,
+                    x=x, w=w, b=b,
+                    x_q=x_q, w_q=w_q, b_q=b_q,
+                    y_quant=y_out,
+                )
 
         return y_out
 
