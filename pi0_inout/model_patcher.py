@@ -181,6 +181,7 @@ def patch_model(
     functional_model_factory=None,
     op_scopes: Optional[set["OpScope"]] = None,
     reference_store=None,
+    noise_injection: float = 0.0,
     verbose: bool = False,
 ) -> nn.Module:
     """
@@ -255,6 +256,7 @@ def patch_model(
             component=component,
             layer_name=name,
             tracker=tracker,
+            noise_injection=noise_injection,
             functional_model=fm,
             reference_store=reference_store,
         )
