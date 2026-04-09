@@ -183,3 +183,138 @@ uv run experiments/sweep_extra_bits.py \
 | `--seed` | `0` | Seeds numpy RNG (observations) and torch RNG (diffusion noise) |
 | `--active-groups` | all | Comma-separated components to quantize |
 | `--results-dir` | `experiments/results` | Root directory for outputs |
+
+---
+
+## Per-layer quantization evaluation (`run_eval_mx_io.py`)
+
+`run_eval_mx_io.py` patches Pi0's `nn.Linear` layers with quantization (either a hardware-accurate functional model or software format-flag quantization), runs two full inference passes on the same observations, and reports per-layer RMSE between the unpatched and patched outputs. With `--save-tensors`, it also writes per-layer matmul I/O tensors as `.npz` files — base model and functional model inputs/outputs — for use as golden data by verification teams.
+
+### Two-pass flow
+
+**Pass 1 — Reference (unpatched):** the model runs as-is, capturing each `nn.Linear`'s activation input, weight, bias, and output.
+
+**Pass 2 — Patched:** each `nn.Linear` is replaced with `QuantLinear`. Crucially, each patched layer receives the **same clean activation from Pass 1** rather than the accumulated quantized activation from earlier layers. This isolates per-layer error from end-to-end propagated error, making RMSE measurements per-layer independent.
+
+### Matrix path
+
+Choose one mode; they are mutually exclusive:
+
+| Mode | Flags | What it does |
+|---|---|---|
+| Hardware-accurate sim | `--functional-model NAME` | Delegates the matmul to a functional model (e.g. `ipt_numba`) that simulates hardware-accurate FP8 arithmetic tile by tile |
+| Software format flags | `--mx-input-fmt` / `--mx-output-fmt` | Quantizes activations + weights to a software IEEE format (FP8, FP16, BF16) and computes in that dtype |
+| Passthrough (default) | *(neither set)* | BF16 no-op; measures RMSE overhead of the patching infrastructure (~0) |
+
+Available functional models: `ipt`, `ipt_numba`, `ipt_c`, `systolic_c`.
+
+### Usage
+
+```bash
+# Hardware-accurate IPT simulation on vision linear layers, real sim observation, with tensor capture:
+CUDA_VISIBLE_DEVICES=1 uv run python experiments/run_eval_mx_io.py \
+    --label ipt_numba_mx_io_vision_linear \
+    --functional-model ipt_numba \
+    --ops linear \
+    --active-groups vision \
+    --steps 3 \
+    --save-tensors \
+    --obs-dir sim-evals/runs/2026-04-07/19-57-01 \
+    --obs-file obs_0000.npz \
+    --checkpoint-dir /nscratch/juhyundo/pi0-quant/datasets/openpi/openpi-assets/checkpoints/pi0_droid_jointpos_safetensors \
+    --config pi0_droid_jointpos_polaris
+
+# Software FP8 format-flag quantization, all op types, random dummy observations:
+CUDA_VISIBLE_DEVICES=0 uv run python experiments/run_eval_mx_io.py \
+    --label fp8_linear_all \
+    --mx-input-fmt float8_e4m3 --mx-output-fmt bfloat16 \
+    --ops linear,conv2d,attention \
+    --n-obs 4 --steps 10 \
+    --checkpoint-dir /path/to/checkpoint \
+    --config pi0_droid_jointpos_polaris
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--label` | *(required)* | Run label — used as the output folder name under `--results-dir` |
+| `--checkpoint-dir` | `/scratch/chloe.wong/data/pi05_base` | Path to model checkpoint directory |
+| `--config` | `pi05_droid_jointpos_polaris` | openpi training config name |
+| `--gpu` | `0` | CUDA device index (use with `CUDA_VISIBLE_DEVICES`) |
+| `--n-obs` | `4` | Number of random dummy observations; ignored when `--obs-dir` is set |
+| `--obs-dir` | — | Directory of `obs_*.npz` files from sim-evals; loads real observations instead of random dummies |
+| `--obs-file` | — | Single `obs_*.npz` filename or path; requires `--obs-dir` (used for norm_stats lookup) |
+| `--norm-stats-dir` | — | Directory containing `norm_stats.json`; defaults to `--checkpoint-dir` |
+| `--steps` | `10` | Diffusion denoising steps per `sample_actions` call |
+| `--functional-model` | — | Hardware-accurate matmul sim: `ipt`, `ipt_numba`, `ipt_c`, `systolic_c`; mutually exclusive with `--mx-input-fmt` |
+| `--mx-input-fmt` | `passthrough` | Format-flag quantization for matmul inputs (activations + weights): `float8_e4m3`, `float8_e5m2`, `float16`, `bfloat16`, `passthrough` |
+| `--mx-output-fmt` | `passthrough` | Format-flag quantization for matmul outputs |
+| `--vec-input-fmt` | `passthrough` | Format-flag quantization for vector op inputs (independent of matrix path) |
+| `--vec-output-fmt` | `passthrough` | Format-flag quantization for vector op outputs |
+| `--ops` | `linear` | Comma-separated op types to patch: `linear`, `conv2d`, `attention` |
+| `--active-groups` | all | Comma-separated model components to quantize: `vision`, `language`, `action_expert`, `action_head` |
+| `--fp8-mode` | `po2` | FP8 scaling mode: `po2` = power-of-two scale (hardware-friendly), `abs` = absmax scale |
+| `--save-tensors` | off | Save per-layer matmul I/O tensors to `<results-dir>/<label>/tensors/` (one `.npz` per layer) |
+| `--results-dir` | `experiments/results` | Root directory for all outputs |
+
+### Output files
+
+All outputs are written to `<results-dir>/<label>/`:
+
+- `config.json` — exact parameters used (checkpoint, formats, groups, ops, elapsed time)
+- `chronological.csv` — one row per patched op call in execution order; columns: `seq`, `tag` (`mx`/`vec`), `layer_name`, `component`, `rmse`, `ref_rms`, `rel_rmse`, `cumulative_rmse`, `cumulative_rel_rmse`
+- `grouped.csv` — same rows sorted by `(component, layer_name, tag)` for per-layer analysis
+- `summary.csv` — per-component aggregate stats (`n_layers`, `mean/std/max/min_rmse`, `mean/std/max_rel_rmse`, `max_rel_rmse_layer`, `total_calls`, `mean_cumulative_rel_rmse`); separate rows for `mx` and `vec`
+- `worst_layers.csv` — top-20 layers by `rel_rmse` across all components and tags
+- `tensors/` — one `.npz` per patched layer (only written when `--save-tensors` is set; see below)
+
+A row is also appended to `<results-dir>/all_runs_summary.csv` after each run.
+
+### NPZ tensor format (`--save-tensors`)
+
+One file per patched layer. Layer names use dots as path separators; dots are replaced with `__` in filenames:
+```
+paligemma_with_expert__paligemma__language_model__model__layers__0__self_attn__q_proj.npz
+```
+
+Only layers belonging to `--active-groups` are saved; layers outside the active groups are not captured.
+
+#### Unpatched pass (base model) — stored as int16 raw BF16 bits
+
+Reconstruct with: `torch.from_numpy(arr).view(torch.bfloat16)`
+
+| Key | Shape | Description |
+|---|---|---|
+| `unpatched_x` | `[N, *]` | Activation input to the layer |
+| `unpatched_w` | `[out, in]` | Weight matrix (static; stored once) |
+| `unpatched_b` | `[out]` | Bias (static; absent if layer has no bias) |
+| `unpatched_y` | `[N, *]` | Output of `F.linear(x, w, b)` |
+
+`N` = number of times the layer was called across all diffusion steps and observations. Vision ViT layers are typically called once per observation (image features are not recomputed per denoising step).
+
+#### Patched pass (functional model) — FP8 fields as uint8 raw bits, output as int16 BF16 bits
+
+Reconstruct FP8: `torch.from_numpy(arr).view(torch.float8_e4m3fn) * scale`
+Reconstruct output: `torch.from_numpy(arr).view(torch.bfloat16)`
+
+| Key | Shape | Description |
+|---|---|---|
+| `patched_x_fp8` | `[N, *]` | Raw FP8 E4M3 bytes of activation input |
+| `patched_x_fp8_scale` | scalar float32 | Per-tensor scale for activation |
+| `patched_w_fp8` | `[out, in]` | Raw FP8 E4M3 bytes of weight (static) |
+| `patched_w_fp8_scale` | scalar float32 | Per-tensor scale for weight (static) |
+| `patched_b_fp8` | `[out]` | Raw FP8 E4M3 bytes of bias (static; absent if no bias) |
+| `patched_b_fp8_scale` | scalar float32 | Per-tensor scale for bias (static; absent if no bias) |
+| `patched_y_quant` | `[N, *]` | Functional model output (BF16 bits) |
+
+`patched_y_quant` is the output of the functional model (e.g. `ipt_numba`) given the clean reference activation from Pass 1. The FP8 fields use per-tensor absmax scaling (`--fp8-mode`) applied independently for storage — this is a separate quantization done for compact representation and may differ from the functional model's internal FP8 encoding.
+
+If shapes are inconsistent across calls (rare), arrays fall back to per-call naming: `prefix_key_call0`, `prefix_key_call1`, etc.
+
+### Caveats
+
+- **Reusing `--label`**: the output directory is created with `exist_ok=True` — no warning is emitted. All per-run CSVs (`config.json`, `chronological.csv`, etc.) are silently overwritten. In `tensors/`, npz files for layers active in the new run are overwritten; files for layers **not** in the new run (e.g. from a prior wider `--active-groups`) are left untouched, silently mixing tensors from two different runs.
+- **`--functional-model` and `--mx-input-fmt`** are mutually exclusive. Setting both raises a `ValueError` in `QuantLinear`.
+- **`--obs-file` requires `--obs-dir`**: `--obs-dir` is used to locate `norm_stats.json` even when `--obs-file` points to a file outside that directory.
+- **`--n-obs` is ignored** when `--obs-dir` is set; all matching `obs_*.npz` files in the directory are loaded (or the single file specified by `--obs-file`).
