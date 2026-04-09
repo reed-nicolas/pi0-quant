@@ -14,17 +14,17 @@ Unpatched pass (via forward hooks registered in run_eval.py):
 
 Patched pass (via QuantLinear.forward):
     patched_x_fp8        [N, *]  raw FP8 E4M3 bytes of input (uint8)
-    patched_x_fp8_scale  scalar  per-tensor scale for x (float32)
+    patched_x_fp8_scale  scalar  per-tensor scale exponent for x (int32): scale = 2 ** exp
     patched_w_fp8        [out, in]  raw FP8 E4M3 bytes of weight (uint8; stored once)
-    patched_w_fp8_scale  scalar  per-tensor scale for w (float32; stored once)
+    patched_w_fp8_scale  scalar  per-tensor scale exponent for w (int32; stored once): scale = 2 ** exp
     patched_b_fp8        [out]  raw FP8 E4M3 bytes of bias (uint8; stored once; absent if no bias)
-    patched_b_fp8_scale  scalar  per-tensor scale for b (float32; stored once; absent if no bias)
+    patched_b_fp8_scale  scalar  per-tensor scale exponent for b (int32; stored once; absent if no bias): scale = 2 ** exp
     patched_y_quant      [N, *]  functional model / format-flag output (int16 BF16 bits)
 
 BF16 arrays stored as int16 raw bits (numpy lacks native bf16).
   Reconstruct: torch.from_numpy(arr).view(torch.bfloat16)
-FP8 arrays stored as uint8 raw bits.
-  Reconstruct: torch.from_numpy(arr).view(torch.float8_e4m3fn) * scale
+FP8 arrays stored as uint8 raw bits + int32 scale exponent.
+  Reconstruct: torch.from_numpy(arr).view(torch.float8_e4m3fn) * (2 ** scale_exp)
 
 File naming
 -----------
@@ -49,9 +49,9 @@ import torch
 # ---------------------------------------------------------------------------
 
 def _to_bf16_numpy(t: torch.Tensor) -> np.ndarray:
-    """CPU transfer in bf16, stored as int16 raw bits (numpy lacks native bf16).
-    Reload with: torch.from_numpy(arr).view(torch.bfloat16)"""
-    return t.detach().to(torch.bfloat16).view(torch.int16).cpu().numpy()
+    """Store bf16 tensor as int16 raw bits (numpy lacks native bf16).
+    Assumes input is already bfloat16. Reload with: torch.from_numpy(arr).view(torch.bfloat16)"""
+    return t.detach().view(torch.int16).cpu().numpy()
 
 
 def _maybe_bf16_numpy(t: Optional[torch.Tensor]) -> Optional[np.ndarray]:
@@ -157,21 +157,21 @@ class MatmulIOStore:
         self,
         name: str,
         x_fp8: torch.Tensor,
-        x_fp8_scale: float,
+        x_fp8_scale: int,
         w_fp8: torch.Tensor,
-        w_fp8_scale: float,
+        w_fp8_scale: int,
         b_fp8: Optional[torch.Tensor],
-        b_fp8_scale: Optional[float],
+        b_fp8_scale: Optional[int],
         y_quant: torch.Tensor,
     ) -> None:
         """Called from QuantLinear.forward() during the patched pass."""
         self._patched[name].append({
             "x_fp8":       _to_uint8_numpy(x_fp8),
-            "x_fp8_scale": np.float32(x_fp8_scale),
+            "x_fp8_scale": np.int32(x_fp8_scale),
             "w_fp8":       _to_uint8_numpy(w_fp8),
-            "w_fp8_scale": np.float32(w_fp8_scale),
+            "w_fp8_scale": np.int32(w_fp8_scale),
             "b_fp8":       _maybe_uint8_numpy(b_fp8),
-            "b_fp8_scale": np.float32(b_fp8_scale) if b_fp8_scale is not None else None,
+            "b_fp8_scale": np.int32(b_fp8_scale) if b_fp8_scale is not None else None,
             "y_quant":     _to_bf16_numpy(y_quant),
         })
 

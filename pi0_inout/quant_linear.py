@@ -172,10 +172,10 @@ class QuantLinear(nn.Module):
             _in_quant_guard.active = True
             try:
                 with torch.no_grad():
-                    x_fp8, x_scale = quant_fp8_raw(x.float())
-                    w_fp8, w_scale = quant_fp8_raw(w.float())
+                    x_fp8, x_scale = quant_fp8_raw(x)
+                    w_fp8, w_scale = quant_fp8_raw(w)
                     if b is not None:
-                        b_fp8, b_scale = quant_fp8_raw(b.float())
+                        b_fp8, b_scale = quant_fp8_raw(b)
                     else:
                         b_fp8, b_scale = None, None
                     self.matmul_io_store.record_patched(
