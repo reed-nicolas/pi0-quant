@@ -37,7 +37,7 @@ class ReferenceStore:
     """
 
     def __init__(self) -> None:
-        # layer_name -> [tensor_call0, tensor_call1, ...]  (detached clones, on original device)
+        # layer_name -> [tensor_call0, tensor_call1, ...]  (CPU, detached)
         self._outputs: dict[str, list[torch.Tensor]] = {}
         # per-layer call index for the current patched forward pass
         self._counters: dict[str, int] = {}
@@ -57,7 +57,7 @@ class ReferenceStore:
                     if isinstance(out, torch.Tensor):
                         if n not in self._outputs:
                             self._outputs[n] = []
-                        self._outputs[n].append(out.detach().clone())
+                        self._outputs[n].append(out.detach().cpu())
                 return _hook
 
             handles.append(module.register_forward_hook(_make_hook(name)))
@@ -85,7 +85,7 @@ class ReferenceStore:
         """
         if name not in self._outputs:
             self._outputs[name] = []
-        self._outputs[name].append(tensor.detach().clone())
+        self._outputs[name].append(tensor.detach().cpu())
 
     def reset_counters(self) -> None:
         """Reset per-layer call indices. Call before each patched forward pass."""
