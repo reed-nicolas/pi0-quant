@@ -221,7 +221,20 @@ CUDA_VISIBLE_DEVICES=1 uv run python experiments/run_eval_mx_io.py \
     --save-tensors \
     --obs-dir sim-evals/runs/2026-04-07/19-57-01 \
     --obs-file obs_0000.npz \
-    --checkpoint-dir /nscratch/juhyundo/pi0-quant/datasets/openpi/openpi-assets/checkpoints/pi0_droid_jointpos_safetensors \
+    --checkpoint-dir datasets/openpi/openpi-assets/checkpoints/pi0_droid_jointpos_safetensors \
+    --config pi0_droid_jointpos_polaris
+
+# Systolic-array simulation on vision linear layers, real sim observation, with tensor capture:
+CUDA_VISIBLE_DEVICES=1 uv run python experiments/run_eval_mx_io.py \
+    --label systolic__mx_io_vision_linear \
+    --functional-model systolic_c \
+    --ops linear \
+    --active-groups vision \
+    --steps 3 \
+    --save-tensors \
+    --obs-dir sim-evals/runs/2026-04-07/19-57-01 \
+    --obs-file obs_0000.npz \
+    --checkpoint-dir datasets/openpi/openpi-assets/checkpoints/pi0_droid_jointpos_safetensors \
     --config pi0_droid_jointpos_polaris
 
 # Software FP8 format-flag quantization, all op types, random dummy observations:
@@ -295,20 +308,20 @@ Reconstruct with: `torch.from_numpy(arr).view(torch.bfloat16)`
 
 #### Patched pass (functional model) — FP8 fields as uint8 raw bits, output as int16 BF16 bits
 
-Reconstruct FP8: `torch.from_numpy(arr).view(torch.float8_e4m3fn) * scale`
+Reconstruct FP8: `torch.from_numpy(arr).view(torch.float8_e4m3fn) * (2 ** scale_exp)`
 Reconstruct output: `torch.from_numpy(arr).view(torch.bfloat16)`
 
 | Key | Shape | Description |
 |---|---|---|
 | `patched_x_fp8` | `[N, *]` | Raw FP8 E4M3 bytes of activation input |
-| `patched_x_fp8_scale` | scalar float32 | Per-tensor scale for activation |
+| `patched_x_fp8_scale` | `int32[N]` | Per-call scale exponent for activation; `scale = 2 ** exp` |
 | `patched_w_fp8` | `[out, in]` | Raw FP8 E4M3 bytes of weight (static) |
-| `patched_w_fp8_scale` | scalar float32 | Per-tensor scale for weight (static) |
+| `patched_w_fp8_scale` | `int32` scalar | Scale exponent for weight (static) |
 | `patched_b_fp8` | `[out]` | Raw FP8 E4M3 bytes of bias (static; absent if no bias) |
-| `patched_b_fp8_scale` | scalar float32 | Per-tensor scale for bias (static; absent if no bias) |
+| `patched_b_fp8_scale` | `int32` scalar | Scale exponent for bias (static; absent if no bias) |
 | `patched_y_quant` | `[N, *]` | Functional model output (BF16 bits) |
 
-`patched_y_quant` is the output of the functional model (e.g. `ipt_numba`) given the clean reference activation from Pass 1. The FP8 fields use per-tensor absmax scaling (`--fp8-mode`) applied independently for storage — this is a separate quantization done for compact representation and may differ from the functional model's internal FP8 encoding.
+`patched_y_quant` is the output of the functional model (e.g. `ipt_numba`) given the clean reference activation from Pass 1. The FP8 fields always use power-of-two scaling (po2 mode) for storage — scales are stored as integer exponents (`int32`) since `scale = 2 ** exp` exactly. This is a separate quantization done for compact representation and may differ from the functional model's internal FP8 encoding.
 
 If shapes are inconsistent across calls (rare), arrays fall back to per-call naming: `prefix_key_call0`, `prefix_key_call1`, etc.
 
@@ -318,3 +331,37 @@ If shapes are inconsistent across calls (rare), arrays fall back to per-call nam
 - **`--functional-model` and `--mx-input-fmt`** are mutually exclusive. Setting both raises a `ValueError` in `QuantLinear`.
 - **`--obs-file` requires `--obs-dir`**: `--obs-dir` is used to locate `norm_stats.json` even when `--obs-file` points to a file outside that directory.
 - **`--n-obs` is ignored** when `--obs-dir` is set; all matching `obs_*.npz` files in the directory are loaded (or the single file specified by `--obs-file`).
+
+---
+
+## Decode matmul I/O tensors (`decode_npz.py`)
+
+`decode_npz.py` reads a `.npz` file produced by `run_eval_mx_io.py --save-tensors`, reconstructs the original float values from their packed representations (BF16 raw int16 bits, FP8 E4M3 raw uint8 bits with per-tensor power-of-two scale), and prints them — or a per-tensor statistics summary — to stdout and optionally to a log file.
+
+### Reconstruction equations
+
+| Stored encoding | Reconstruction |
+|---|---|
+| `unpatched_*` / `patched_y_quant` (int16 BF16 bits) | `torch.from_numpy(arr).view(torch.bfloat16)` |
+| `patched_{x,w,b}_fp8` (uint8 FP8 E4M3 bits) + `*_fp8_scale` (int32 exponent) | `view(torch.float8_e4m3fn).float() * (2 ** scale_exp)` |
+
+### Usage
+
+```bash
+# Print all tensor values for call 0 (default), also save to a log file:
+uv run decode_npz.py \
+    experiments/results/ipt_numba_mx_io_vision_linear_exp/tensors/paligemma_with_expert__paligemma__model__vision_tower__vision_model__encoder__layers__0__mlp__fc1.npz \
+    --log-dir experiments/results/ipt_numba_mx_io_vision_linear_exp/
+
+# Print per-tensor statistics summary (min/max/mean/scale_exp) for call 1:
+uv run decode_npz.py path/to/layer.npz --summary --call 1
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `npz` | *(required)* | Path to `.npz` file from `--save-tensors` |
+| `--summary` | off | Print per-tensor stats (min/max/mean/scale_exp) instead of raw values |
+| `--call` | `0` | Which inference call index to decode (vision layers: typically 0) |
+| `--log-dir` | stdout only | Directory to write a `.log` file; filename is `<layer_stem>_call<N>.log` |
