@@ -14,11 +14,11 @@ Unpatched pass (via forward hooks registered in run_eval.py):
 
 Patched pass (via QuantLinear.forward):
     patched_x_fp8        [N, *]  raw FP8 E4M3 bytes of input (uint8)
-    patched_x_fp8_scale  scalar  per-tensor scale exponent for x (int32): scale = 2 ** exp
+    patched_x_fp8_scale  scalar  per-tensor scale exponent for x (int8): scale = 2 ** exp
     patched_w_fp8        [out, in]  raw FP8 E4M3 bytes of weight (uint8; stored once)
-    patched_w_fp8_scale  scalar  per-tensor scale exponent for w (int32; stored once): scale = 2 ** exp
+    patched_w_fp8_scale  scalar  per-tensor scale exponent for w (int8; stored once): scale = 2 ** exp
     patched_b_fp8        [out]  raw FP8 E4M3 bytes of bias (uint8; stored once; absent if no bias)
-    patched_b_fp8_scale  scalar  per-tensor scale exponent for b (int32; stored once; absent if no bias): scale = 2 ** exp
+    patched_b_fp8_scale  scalar  per-tensor scale exponent for b (int8; stored once; absent if no bias): scale = 2 ** exp
     patched_y_quant      [N, *]  functional model / format-flag output (int16 BF16 bits)
 
 BF16 arrays stored as int16 raw bits (numpy lacks native bf16).
@@ -167,11 +167,11 @@ class MatmulIOStore:
         """Called from QuantLinear.forward() during the patched pass."""
         self._patched[name].append({
             "x_fp8":       _to_uint8_numpy(x_fp8),
-            "x_fp8_scale": np.int32(x_fp8_scale),
+            "x_fp8_scale": np.int8(x_fp8_scale),
             "w_fp8":       _to_uint8_numpy(w_fp8),
-            "w_fp8_scale": np.int32(w_fp8_scale),
+            "w_fp8_scale": np.int8(w_fp8_scale),
             "b_fp8":       _maybe_uint8_numpy(b_fp8),
-            "b_fp8_scale": np.int32(b_fp8_scale) if b_fp8_scale is not None else None,
+            "b_fp8_scale": np.int8(b_fp8_scale) if b_fp8_scale is not None else None,
             "y_quant":     _to_bf16_numpy(y_quant),
         })
 

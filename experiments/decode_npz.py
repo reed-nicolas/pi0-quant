@@ -14,7 +14,7 @@ Unpatched fields (unpatched_x, unpatched_w, unpatched_b, unpatched_y):
     value = reinterpret_cast<bfloat16>(int16_array)
 
 Patched inputs/weight/bias (FP8 E4M3):
-    stored as (uint8 raw-bit-pattern, int32 scale exponent)
+    stored as (uint8 raw-bit-pattern, int8 scale exponent)
     value = reinterpret_cast<float8_e4m3fn>(uint8_array) * (2 ** scale_exp)
     where scale_exp is ONE integer for the ENTIRE tensor (po2 mode only):
       scale_exp = floor(log2(max(|x_ij|) / 256.0))
