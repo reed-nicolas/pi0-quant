@@ -183,6 +183,7 @@ def patch_model(
     reference_store=None,
     matmul_io_store=None,
     ref_input_store=None,
+    noise_injection: float = 0.0,
     verbose: bool = False,
 ) -> nn.Module:
     """
@@ -257,6 +258,7 @@ def patch_model(
             component=component,
             layer_name=name,
             tracker=tracker,
+            noise_injection=noise_injection,
             functional_model=fm,
             reference_store=reference_store,
             matmul_io_store=matmul_io_store,

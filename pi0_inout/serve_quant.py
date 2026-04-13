@@ -436,7 +436,7 @@ class Pi0PyTorchPolicy:
     ) -> None:
         self.model    = model
         self.device   = device
-        self.metadata = {"model": "PI0Pytorch", "quantized": True}
+        self.metadata: dict = {"model": "PI0Pytorch", "quantized": True}
         self.norm_stats = norm_stats
         self.use_quantile_norm = use_quantile_norm
         self.is_joint_position = is_joint_position
@@ -650,6 +650,7 @@ def main() -> None:
         mx_output_fmt=mx_output_fmt,
         tracker=tracker,
         active_groups=active_groups,
+        noise_injection=args.rel_err,
         verbose=False,
     )
     attn_handles = patch_attn_sdpa(
@@ -661,7 +662,7 @@ def main() -> None:
     )
     logger.info(
         f"Model patched: mx_input_fmt={mx_input_fmt.value}  mx_output_fmt={mx_output_fmt.value}  "
-        f"components={args.quantize_components}"
+        f"rel_err={args.rel_err}  components={args.quantize_components}"
     )
 
     # ── Print quantization diagnostics ────────────────────────────────────
@@ -717,11 +718,17 @@ def main() -> None:
         max_token_len=cfg.max_token_len,
         tokenizer_path=args.tokenizer_path,
     )
+    policy.metadata["quant"] = {
+        "mx_input_fmt": mx_input_fmt.value,
+        "mx_output_fmt": mx_output_fmt.value,
+        "rel_err": args.rel_err,
+    }
 
     from openpi.serving import websocket_policy_server
     import socket
     logger.info(f"Starting server on {socket.gethostname()}:{args.port}  "
-                f"(mx_input={mx_input_fmt.value}, mx_output={mx_output_fmt.value})")
+                f"(mx_input={mx_input_fmt.value}, mx_output={mx_output_fmt.value}, "
+                f"rel_err={args.rel_err})")
 
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
@@ -782,6 +789,11 @@ def parse_args() -> argparse.Namespace:
             "Example: --quantize-components transformer action_head"
         ),
     )
+
+    # Noise injection
+    p.add_argument("--rel-err", type=float, default=0.0,
+                   help="Relative-error noise fraction injected into each matmul output "
+                        "(e.g. 0.01 = 1%%). 0 = disabled.")
 
     # Output
     p.add_argument("--stats-output", default=None,
