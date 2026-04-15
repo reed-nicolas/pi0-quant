@@ -77,6 +77,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .quant_linear import QuantLinear
+from .rel_noise import NoiseMode
 from .quant_types import QuantFormat, quant
 from .stats_tracker import Component, StatsTracker
 
@@ -184,6 +185,7 @@ def patch_model(
     matmul_io_store=None,
     ref_input_store=None,
     noise_injection: float = 0.0,
+    noise_mode: NoiseMode = NoiseMode.UNIFORM,
     verbose: bool = False,
 ) -> nn.Module:
     """
@@ -259,6 +261,7 @@ def patch_model(
             layer_name=name,
             tracker=tracker,
             noise_injection=noise_injection,
+            noise_mode=noise_mode,
             functional_model=fm,
             reference_store=reference_store,
             matmul_io_store=matmul_io_store,
