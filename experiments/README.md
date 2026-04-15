@@ -50,9 +50,9 @@ uv run experiments/sweep_extra_bits.py \
 
 ---
 
-## Per-layer quantization evaluation (`run_eval_mx_io.py`)
+## Per-layer quantization evaluation (`run_eval_mxu_io.py`)
 
-`run_eval_mx_io.py` patches Pi0's `nn.Linear` layers with quantization (either a hardware-accurate functional model or software format-flag quantization), runs two full inference passes on the same observations, and reports per-layer RMSE between the unpatched and patched outputs. With `--save-tensors`, it also writes per-layer matmul I/O tensors as `.npz` files — base model and functional model inputs/outputs — for use as golden data by verification teams.
+`run_eval_mxu_io.py` patches Pi0's `nn.Linear` layers with quantization (either a hardware-accurate functional model or software format-flag quantization), runs two full inference passes on the same observations, and reports per-layer RMSE between the unpatched and patched outputs. With `--save-tensors`, it also writes per-layer matmul I/O tensors as `.npz` files — base model and functional model inputs/outputs — for use as golden data by verification teams.
 
 ### Two-pass flow
 
@@ -76,7 +76,7 @@ Available functional models: `ipt`, `ipt_numba`, `ipt_c`, `systolic_c`.
 
 ```bash
 # Hardware-accurate IPT simulation on vision linear layers, real sim observation, with tensor capture:
-CUDA_VISIBLE_DEVICES=1 uv run python experiments/run_eval_mx_io.py \
+CUDA_VISIBLE_DEVICES=1 uv run python experiments/run_eval_mxu_io.py \
     --label ipt_numba_mx_io_vision_linear \
     --functional-model ipt_numba \
     --ops linear \
@@ -89,7 +89,7 @@ CUDA_VISIBLE_DEVICES=1 uv run python experiments/run_eval_mx_io.py \
     --config pi0_droid_jointpos_polaris
 
 # Systolic-array simulation on vision linear layers, real sim observation, with tensor capture:
-CUDA_VISIBLE_DEVICES=1 uv run python experiments/run_eval_mx_io.py \
+CUDA_VISIBLE_DEVICES=1 uv run python experiments/run_eval_mxu_io.py \
     --label systolic__mx_io_vision_linear \
     --functional-model systolic_c \
     --ops linear \
@@ -102,7 +102,7 @@ CUDA_VISIBLE_DEVICES=1 uv run python experiments/run_eval_mx_io.py \
     --config pi0_droid_jointpos_polaris
 
 # Software FP8 format-flag quantization, all op types, random dummy observations:
-CUDA_VISIBLE_DEVICES=0 uv run python experiments/run_eval_mx_io.py \
+CUDA_VISIBLE_DEVICES=0 uv run python experiments/run_eval_mxu_io.py \
     --label fp8_linear_all \
     --mx-input-fmt float8_e4m3 --mx-output-fmt bfloat16 \
     --ops linear,conv2d,attention \
@@ -200,7 +200,7 @@ If shapes are inconsistent across calls (rare), arrays fall back to per-call nam
 
 ## Decode matmul I/O tensors (`decode_npz.py`)
 
-`decode_npz.py` reads a `.npz` file produced by `run_eval_mx_io.py --save-tensors`, reconstructs the original float values from their packed representations (BF16 raw int16 bits, FP8 E4M3 raw uint8 bits with per-tensor power-of-two scale), and prints them — or a per-tensor statistics summary — to stdout and optionally to a log file.
+`decode_npz.py` reads a `.npz` file produced by `run_eval_mxu_io.py --save-tensors`, reconstructs the original float values from their packed representations (BF16 raw int16 bits, FP8 E4M3 raw uint8 bits with per-tensor power-of-two scale), and prints them — or a per-tensor statistics summary — to stdout and optionally to a log file.
 
 ### Reconstruction equations
 
