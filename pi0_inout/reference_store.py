@@ -13,7 +13,7 @@ Usage in run_eval.py:
             model.sample_actions(device, obs, num_steps=num_steps)
     for h in handles:
         h.remove()
-    # store now holds reference outputs for all layers, in call order
+    # store now holds reference outputs for all layers, in call order (tensors stay on GPU)
 
     # Pass to patch_model:
     patch_model(model, ..., reference_store=store)

@@ -34,9 +34,10 @@ import torch.nn.functional as F
 from typing import Optional
 
 from ._dispatch_guards import _in_quant_guard
-from .quant_types import QuantFormat, quant
+from .quant_types import QuantFormat, quant, quant_fp8_raw
 from .stats_tracker import StatsTracker, Component
 from .rel_noise import inject_rel_noise, NoiseMode
+from .matmul_io_store import MatmulIOStore
 
 
 class QuantLinear(nn.Module):
@@ -68,6 +69,8 @@ class QuantLinear(nn.Module):
         noise_mode: NoiseMode = NoiseMode.UNIFORM,
         functional_model=None,
         reference_store=None,
+        matmul_io_store: Optional[MatmulIOStore] = None,
+        ref_input_store=None,
     ) -> None:
         super().__init__()
 
@@ -96,6 +99,8 @@ class QuantLinear(nn.Module):
         self.in_features     = linear.in_features
         self.out_features    = linear.out_features
         self.reference_store = reference_store
+        self.matmul_io_store = matmul_io_store
+        self.ref_input_store = ref_input_store
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight
@@ -105,6 +110,14 @@ class QuantLinear(nn.Module):
         # matches what the reference F.linear does and ensures passthrough gives 0 RMSE.
         dtype = w.dtype
         x = x.to(dtype)
+
+        # ── Substitute clean reference input (golden-data mode) ───────────────
+        if self.ref_input_store is not None:
+            x_clean = self.ref_input_store.get(self.layer_name)
+            if x_clean is not None:
+                x = x_clean.to(dtype=dtype, device=x.device)
+
+        x_q = w_q = b_q = None  # only populated in format-flag path
 
         if self.functional_model is not None:
             # Functional model handles quantization internally; pass tensors as-is.
@@ -127,6 +140,11 @@ class QuantLinear(nn.Module):
             # ── Quantize output, cast back to original dtype ──────────────────
             y_out = quant(y_accum.float(), self.mx_output_fmt).to(dtype)
 
+        # ── Fetch clean reference for tracker cumulative RMSE ────────────────
+        y_clean_ref = None
+        if self.tracker is not None and self.reference_store is not None:
+            y_clean_ref = self.reference_store.get(self.layer_name)
+
         # ── RMSE vs original model (native dtype, no fp32 upcast) ─────────────
         # Shield this block from VectorQuantMode interception: the arithmetic
         # inside tracker.record() (sub, pow, mean) must not be re-quantized.
@@ -137,14 +155,37 @@ class QuantLinear(nn.Module):
             try:
                 with torch.no_grad():
                     y_ref = F.linear(x, w, b)
-                    y_clean_ref = (self.reference_store.get(self.layer_name)
-                                   if self.reference_store is not None else None)
                     self.tracker.record(
                         name=self.layer_name,
                         component=self.component,
                         y_fp=y_ref,
                         y_quant=y_out,
                         y_clean_ref=y_clean_ref,
+                    )
+            finally:
+                _in_quant_guard.active = False
+
+        # ── Matmul I/O tensor capture ─────────────────────────────────────────
+        # Always capture raw FP8 E4M3 bytes + scale for storage, regardless of
+        # mx_input_fmt or functional_model.  Guard with _in_quant_guard: amax()
+        # inside quant_fp8_raw() is in TARGET_OPS and would be re-intercepted by
+        # VectorQuantMode otherwise.
+        if self.matmul_io_store is not None:
+            _in_quant_guard.active = True
+            try:
+                with torch.no_grad():
+                    x_fp8, x_scale = quant_fp8_raw(x)
+                    w_fp8, w_scale = quant_fp8_raw(w)
+                    if b is not None:
+                        b_fp8, b_scale = quant_fp8_raw(b)
+                    else:
+                        b_fp8, b_scale = None, None
+                    self.matmul_io_store.record_patched(
+                        name=self.layer_name,
+                        x_fp8=x_fp8, x_fp8_scale=x_scale,
+                        w_fp8=w_fp8, w_fp8_scale=w_scale,
+                        b_fp8=b_fp8, b_fp8_scale=b_scale,
+                        y_quant=y_out,
                     )
             finally:
                 _in_quant_guard.active = False
