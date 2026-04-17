@@ -240,7 +240,7 @@ ALL_OPS: list[str] = [
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m software_models.vpu.gen_vectors",
+        prog="python -m funct_models_vector.vpu.gen_vectors",
         description="Generate VPU test vectors via the functional VectorEngineModel",
     )
     parser.add_argument("--out", default="vpu_vectors.txt", help="Output file path")
