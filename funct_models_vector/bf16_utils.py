@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import struct
 
-from funct_models_ipt.python_ipt_base.fp_formats import (  # type: ignore
+from software_models.mxu1_ipt.fp_formats import (  # type: ignore
     BF16_MAX_NEG,
     BF16_MAX_POS,
     bf16_bits_to_f32,
